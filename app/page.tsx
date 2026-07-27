@@ -1,5 +1,5 @@
-import VideoCall from './components/video-call';
+import Landing from './components/landing';
 
 export default function HomePage() {
-  return <VideoCall />;
+  return <Landing />;
 }
