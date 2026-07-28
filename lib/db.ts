@@ -1,8 +1,3 @@
-import { mkdir } from 'node:fs/promises';
-import path from 'node:path';
-import { JSONFile } from 'lowdb/node';
-import { Low } from 'lowdb';
-
 export type SignalType = 'peer-joined' | 'offer' | 'answer' | 'candidate' | 'bye';
 
 export type SignalMessage = {
@@ -29,43 +24,31 @@ export type Database = {
   participants: ParticipantRecord[];
 };
 
-const databaseFile = path.join(process.cwd(), 'data', 'jestermaxing.json');
-const defaultData: Database = { rooms: [], participants: [] };
+// In-memory signaling store.
+//
+// Why not the previous lowdb/JSON-file store: every request read AND wrote the
+// file, which serialized all traffic behind disk I/O and made matchmaking slow
+// and racey under real load. Signaling data is short-lived and disposable, so it
+// belongs in memory.
+//
+// It is kept on `globalThis` so the same object survives hot-reloads in `next
+// dev` and every request within ONE Node process (a VPS, a container, `next
+// start`, Render, Railway, Fly, etc.).
+//
+// IMPORTANT — multi-instance hosting: on serverless/edge platforms that run more
+// than one instance (e.g. Vercel by default), each instance holds its OWN copy
+// of this object, so two users routed to different instances will NOT see each
+// other and can never match. For reliable multi-user matchmaking either deploy
+// as a SINGLE always-on instance, or replace this module with a shared store
+// (Redis / Postgres). The exported API below is all the rest of the app uses, so
+// only this file changes when you swap in a real database.
+const globalStore = globalThis as unknown as { __jesterDb?: Database };
+const store: Database = (globalStore.__jesterDb ??= { rooms: [], participants: [] });
 
-let databasePromise: Promise<Low<Database>> | undefined;
-let writeQueue = Promise.resolve();
-
-async function getDatabase() {
-  if (!databasePromise) {
-    databasePromise = (async () => {
-      await mkdir(path.dirname(databaseFile), { recursive: true });
-      const database = new Low(new JSONFile<Database>(databaseFile), defaultData);
-      await database.read();
-      database.data ||= defaultData;
-      return database;
-    })();
-  }
-
-  return databasePromise;
-}
-
-// Route handlers can run at the same time. Serializing reads and writes keeps
-// two users joining simultaneously from overwriting one another in the JSON
-// file. This is intentionally small and can later be replaced by a real DB.
-export function withDatabase<T>(operation: (database: Low<Database>) => Promise<T> | T) {
-  const currentOperation = writeQueue.then(async () => {
-    const database = await getDatabase();
-    await database.read();
-    database.data ||= defaultData;
-    const result = await operation(database);
-    await database.write();
-    return result;
-  });
-
-  writeQueue = currentOperation.then(
-    () => undefined,
-    () => undefined,
-  );
-
-  return currentOperation;
+// The store is a plain object mutated synchronously. Node runs each request
+// handler to completion without yielding on shared memory, so no file lock or
+// write queue is needed. Kept as a function so call sites don't change if this
+// is later swapped for an async/remote store.
+export function withDatabase<T>(operation: (database: { data: Database }) => T): T {
+  return operation({ data: store });
 }

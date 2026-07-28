@@ -7,8 +7,13 @@ function createId(prefix: string) {
   return `${prefix}-${crypto.randomUUID()}`;
 }
 
+// A live client polls every ~400ms (refreshing lastSeen), so 12s without a
+// single successful poll means the tab is really gone. Shorter than the old 30s
+// so ghost participants stop occupying rooms and blocking new matches.
+const PARTICIPANT_TTL_MS = 12_000;
+
 function removeExpiredParticipants(database: { data: Database }) {
-  const cutoff = Date.now() - 30_000;
+  const cutoff = Date.now() - PARTICIPANT_TTL_MS;
   const expiredIds = new Set(
     database.data.participants
       .filter((participant) => participant.lastSeen <= cutoff)
@@ -35,6 +40,7 @@ export async function POST(request: Request) {
     roomId?: string;
     participantId?: string;
     message?: SignalMessage;
+    excludeRoomId?: string;
   };
 
   return withDatabase((database) => {
@@ -46,10 +52,12 @@ export async function POST(request: Request) {
         return Response.json({ error: 'Username must be 1-32 characters' }, { status: 400 });
       }
 
-      // Find the first room with one person. If every room is full, create the
-      // next room. This creates pairs in order: 1+2, 3+4, 5+6, and so on.
+      // Find the first room with a free slot. `excludeRoomId` is the room the
+      // caller just left via "Next player" — skipping it stops them from being
+      // immediately rematched with the same person they were just paired with.
       let room = database.data.rooms.find(
-        (candidate) => candidate.participantIds.length < 2,
+        (candidate) =>
+          candidate.participantIds.length < 2 && candidate.id !== body.excludeRoomId,
       );
       if (!room) {
         room = {
