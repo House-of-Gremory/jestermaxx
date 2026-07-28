@@ -20,6 +20,22 @@ You can start editing the page by modifying `app/page.tsx`. The page auto-update
 
 This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
 
+## Vercel deployment
+
+Matchmaking and WebRTC signaling use Upstash Redis because Vercel can route
+requests to different serverless instances. Create a Redis database in the
+[Upstash Console](https://console.upstash.com/), then add these environment
+variables to the Vercel project:
+
+```text
+UPSTASH_REDIS_REST_URL
+UPSTASH_REDIS_REST_TOKEN
+```
+
+The app uses an in-memory fallback during local development when these values
+are absent. Production requires them. Copy `.env.example` to `.env.local` for
+local testing with a real Redis database.
+
 ## Learn More
 
 To learn more about Next.js, take a look at the following resources:

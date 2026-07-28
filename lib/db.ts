@@ -1,3 +1,5 @@
+import { Redis } from '@upstash/redis';
+
 export type SignalType = 'peer-joined' | 'offer' | 'answer' | 'candidate' | 'bye';
 
 export type SignalMessage = {
@@ -24,31 +26,65 @@ export type Database = {
   participants: ParticipantRecord[];
 };
 
-// In-memory signaling store.
-//
-// Why not the previous lowdb/JSON-file store: every request read AND wrote the
-// file, which serialized all traffic behind disk I/O and made matchmaking slow
-// and racey under real load. Signaling data is short-lived and disposable, so it
-// belongs in memory.
-//
-// It is kept on `globalThis` so the same object survives hot-reloads in `next
-// dev` and every request within ONE Node process (a VPS, a container, `next
-// start`, Render, Railway, Fly, etc.).
-//
-// IMPORTANT — multi-instance hosting: on serverless/edge platforms that run more
-// than one instance (e.g. Vercel by default), each instance holds its OWN copy
-// of this object, so two users routed to different instances will NOT see each
-// other and can never match. For reliable multi-user matchmaking either deploy
-// as a SINGLE always-on instance, or replace this module with a shared store
-// (Redis / Postgres). The exported API below is all the rest of the app uses, so
-// only this file changes when you swap in a real database.
-const globalStore = globalThis as unknown as { __jesterDb?: Database };
-const store: Database = (globalStore.__jesterDb ??= { rooms: [], participants: [] });
+const redis =
+  process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN
+    ? Redis.fromEnv()
+    : null;
+const REDIS_DATA_KEY = 'jestermaxing:signaling';
+const REDIS_LOCK_KEY = 'jestermaxing:signaling:lock';
 
-// The store is a plain object mutated synchronously. Node runs each request
-// handler to completion without yielding on shared memory, so no file lock or
-// write queue is needed. Kept as a function so call sites don't change if this
-// is later swapped for an async/remote store.
-export function withDatabase<T>(operation: (database: { data: Database }) => T): T {
-  return operation({ data: store });
+// Local development fallback. Vercel instances do not share process memory,
+// so production requires the shared Redis store configured above.
+const globalStore = globalThis as unknown as { __jesterDb?: Database };
+const localStore: Database = (globalStore.__jesterDb ??= { rooms: [], participants: [] });
+
+async function acquireLock() {
+  if (!redis) return null;
+
+  const token = crypto.randomUUID();
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    const acquired = await redis.set(REDIS_LOCK_KEY, token, { nx: true, ex: 10 });
+    if (acquired === 'OK') return token;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+
+  throw new Error('Could not acquire signaling store lock');
+}
+
+async function releaseLock(token: string | null) {
+  if (!redis || !token) return;
+
+  // Delete only our lock, preventing a slow request from deleting a newer lock
+  // after the original ten-second lease has expired.
+  await redis.eval(
+    "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+    [REDIS_LOCK_KEY],
+    [token],
+  );
+}
+
+export async function withDatabase<T>(
+  operation: (database: { data: Database }) => T | Promise<T>,
+): Promise<T> {
+  if (!redis) {
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error(
+        'Redis is not configured. Set UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN.',
+      );
+    }
+    return operation({ data: localStore });
+  }
+
+  const lockToken = await acquireLock();
+  try {
+    const data = (await redis.get<Database>(REDIS_DATA_KEY)) ?? {
+      rooms: [],
+      participants: [],
+    };
+    const result = await operation({ data });
+    await redis.set(REDIS_DATA_KEY, data, { ex: 60 * 60 });
+    return result;
+  } finally {
+    await releaseLock(lockToken);
+  }
 }

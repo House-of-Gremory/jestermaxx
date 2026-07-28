@@ -76,7 +76,6 @@ export default function VideoCall() {
 
     stoppedRef.current = false;
     pendingCandidatesRef.current = [];
-    setConnected(false);
     if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
 
     async function sendSignal(message: SignalMessage) {
@@ -194,6 +193,7 @@ export default function VideoCall() {
     }
 
     async function start() {
+      setConnected(false);
       try {
         setStatus('Finding an opponent…');
         const joinResponse = await fetch('/api/signaling', {
