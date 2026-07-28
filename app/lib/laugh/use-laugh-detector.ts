@@ -1,31 +1,35 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { type RefObject, useEffect, useRef, useState } from 'react';
 import { AudioAnalyzer } from './audio-analyzer';
+import { FaceDetector } from './face-detector';
 import { LaughDetector } from './laugh-detector';
-import type { LaughDetectorStatus, LaughEvent } from './types';
+import type { FaceBox, FaceSample, LaughDetectorStatus, LaughEvent } from './types';
 
-// ~30 Hz analysis. Audio windows are tiny and cheap; this never touches the
-// WebRTC signaling loop and does not allocate per frame.
-const FRAME_MS = 33;
+const AUDIO_FRAME_MS = 33; // ~30 Hz audio analysis
+const FACE_FRAME_MS = 66; // ~15 Hz face inference (heavier, throttled harder)
 
-// Drives the audio laugh detector off an existing local MediaStream. Returns
-// only high-level state so React re-renders a handful of times per session, not
-// per frame. A confirmed laugh calls `onLaugh` (kept in a ref so changing the
-// callback never restarts the audio graph).
+// Drives the fused laugh detector off the existing local media. Audio runs every
+// frame; face inference runs at a lower rate and its latest sample is reused by
+// the audio loop, so the two never block each other. Per-frame data stays in
+// refs — React re-renders only on status/face/laugh changes, not per frame.
 export function useLaughDetector({
   stream,
+  videoRef,
+  overlayRef,
   enabled,
   onLaugh,
 }: {
   stream: MediaStream | null;
+  videoRef: RefObject<HTMLVideoElement | null>;
+  overlayRef: RefObject<HTMLCanvasElement | null>;
   enabled: boolean;
   onLaugh?: (event: LaughEvent) => void;
-}): { status: LaughDetectorStatus; recentLaugh: boolean } {
+}): { status: LaughDetectorStatus; recentLaugh: boolean; faceAvailable: boolean } {
   const [status, setStatus] = useState<LaughDetectorStatus>('idle');
   const [recentLaugh, setRecentLaugh] = useState(false);
+  const [faceAvailable, setFaceAvailable] = useState(false);
 
-  // Keep the latest callback without re-running the audio-setup effect.
   const onLaughRef = useRef(onLaugh);
   useEffect(() => {
     onLaughRef.current = onLaugh;
@@ -37,7 +41,6 @@ export function useLaughDetector({
 
     if (!hasAudio) {
       const idle: LaughDetectorStatus = enabled && stream ? 'unavailable' : 'idle';
-      // Deferred so this isn't a synchronous setState inside the effect body.
       const timer = setTimeout(() => {
         if (!cancelled) setStatus(idle);
       }, 0);
@@ -48,29 +51,90 @@ export function useLaughDetector({
     }
 
     const activeStream = stream as MediaStream;
-    let analyzer: AudioAnalyzer | null = null;
+    const overlayCanvas = overlayRef.current; // captured for cleanup
     const detector = new LaughDetector();
+    const faceDetector = new FaceDetector();
+    let analyzer: AudioAnalyzer | null = null;
+
     let rafId = 0;
-    let last = 0;
+    let lastAudio = 0;
+    let lastFace = 0;
     let announced = false;
+    let latestFace: FaceSample | null = null;
+    let faceFlag = false;
     let flashTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const drawOverlay = (box?: FaceBox) => {
+      const canvas = overlayRef.current;
+      const video = videoRef.current;
+      if (!canvas || !video) return;
+      const w = video.clientWidth;
+      const h = video.clientHeight;
+      if (w === 0 || h === 0) return;
+      if (canvas.width !== w) canvas.width = w;
+      if (canvas.height !== h) canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      ctx.clearRect(0, 0, w, h);
+      if (!box) return;
+
+      // Subtle corner brackets around the tracked face — only drawn while a face
+      // is actually detected, so the overlay appears only when tracking.
+      const x = box.x * w;
+      const y = box.y * h;
+      const bw = box.w * w;
+      const bh = box.h * h;
+      const len = Math.min(bw, bh) * 0.22;
+      ctx.strokeStyle = 'rgba(163, 230, 53, 0.65)';
+      ctx.lineWidth = 2;
+      const corners: Array<[number, number, number, number]> = [
+        [x, y, 1, 1],
+        [x + bw, y, -1, 1],
+        [x, y + bh, 1, -1],
+        [x + bw, y + bh, -1, -1],
+      ];
+      for (const [cx, cy, sx, sy] of corners) {
+        ctx.beginPath();
+        ctx.moveTo(cx, cy + sy * len);
+        ctx.lineTo(cx, cy);
+        ctx.lineTo(cx + sx * len, cy);
+        ctx.stroke();
+      }
+    };
 
     const loop = (t: number) => {
       rafId = requestAnimationFrame(loop);
-      if (t - last < FRAME_MS || !analyzer) return;
-      last = t;
-      if (document.hidden) return; // pause detection when the tab is hidden
-      if (!announced) {
-        announced = true;
-        setStatus('listening');
+      if (document.hidden) return;
+
+      // Face inference (throttled) refreshes the shared sample + overlay.
+      if (faceDetector.ready && t - lastFace >= FACE_FRAME_MS && videoRef.current) {
+        lastFace = t;
+        const sample = faceDetector.detect(videoRef.current, t);
+        if (sample) {
+          latestFace = sample;
+          drawOverlay(sample.faceAvailable ? sample.box : undefined);
+          if (sample.faceAvailable !== faceFlag) {
+            faceFlag = sample.faceAvailable;
+            setFaceAvailable(faceFlag);
+          }
+        }
       }
 
-      const event = detector.update(analyzer.getFeatures(), t);
-      if (event) {
-        setRecentLaugh(true);
-        if (flashTimer) clearTimeout(flashTimer);
-        flashTimer = setTimeout(() => setRecentLaugh(false), 1200);
-        onLaughRef.current?.(event);
+      // Audio analysis every frame drives the detector, fusing the latest face.
+      if (analyzer && t - lastAudio >= AUDIO_FRAME_MS) {
+        lastAudio = t;
+        if (!announced) {
+          announced = true;
+          setStatus('listening');
+        }
+        const face = latestFace?.faceAvailable ? (latestFace.features ?? null) : null;
+        const event = detector.update(analyzer.getFeatures(), face, t);
+        if (event) {
+          setRecentLaugh(true);
+          if (flashTimer) clearTimeout(flashTimer);
+          flashTimer = setTimeout(() => setRecentLaugh(false), 1200);
+          onLaughRef.current?.(event);
+        }
       }
     };
 
@@ -84,6 +148,12 @@ export function useLaughDetector({
           return;
         }
         rafId = requestAnimationFrame(loop);
+        // Face model loads in the background; audio-only until it is ready.
+        if (activeStream.getVideoTracks().length > 0) {
+          faceDetector.init().catch((error) => {
+            console.warn('Face detector unavailable, using audio only', error);
+          });
+        }
       } catch (error) {
         console.error('Laugh detector failed to start', error);
         if (!cancelled) setStatus('unavailable');
@@ -95,10 +165,14 @@ export function useLaughDetector({
       if (rafId) cancelAnimationFrame(rafId);
       if (flashTimer) clearTimeout(flashTimer);
       analyzer?.close();
+      faceDetector.close();
+      const ctx = overlayCanvas?.getContext('2d');
+      if (overlayCanvas && ctx) ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
       setRecentLaugh(false);
+      setFaceAvailable(false);
       setStatus('stopped');
     };
-  }, [stream, enabled]);
+  }, [stream, enabled, videoRef, overlayRef]);
 
-  return { status, recentLaugh };
+  return { status, recentLaugh, faceAvailable };
 }
