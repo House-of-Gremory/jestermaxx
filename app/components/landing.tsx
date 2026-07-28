@@ -4,8 +4,8 @@ const STEPS = [
   {
     n: '1',
     emoji: '📷',
-    title: 'CAMERA CHECK',
-    body: 'Complete a quick camera check to get started.',
+    title: 'BUILD YOUR INTRO',
+    body: 'Snap 4 photos, caption them, pick a transition — it doubles as your camera check.',
   },
   {
     n: '2',
@@ -77,16 +77,16 @@ export default function Landing() {
 
           <div className="mt-9 flex flex-col items-center gap-3 sm:flex-row">
             <Link
-              href="/arena"
+              href="/intro"
               className="rounded-xl bg-lime-400 px-8 py-3.5 text-sm font-black uppercase tracking-widest text-black shadow-[0_0_30px_rgba(163,230,53,0.5)] transition hover:-translate-y-0.5 hover:bg-lime-300"
             >
               Enter the Arena
             </Link>
             <Link
-              href="/arena"
+              href="/intro"
               className="rounded-xl border border-white/20 bg-white/5 px-8 py-3.5 text-sm font-bold uppercase tracking-widest text-white/80 backdrop-blur transition hover:border-white/40 hover:text-white"
             >
-              Start Camera Check
+              Build Your Intro
             </Link>
           </div>
         </section>

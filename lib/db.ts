@@ -21,9 +21,24 @@ export type RoomRecord = {
   createdAt: number;
 };
 
+export type IntroSlide = {
+  imagePath: string;
+  text: string;
+  xPct: number;
+  yPct: number;
+};
+
+export type IntroRecord = {
+  username: string;
+  slides: IntroSlide[];
+  transitionId: string;
+  createdAt: number;
+};
+
 export type Database = {
   rooms: RoomRecord[];
   participants: ParticipantRecord[];
+  intros: IntroRecord[];
 };
 
 const redis =
@@ -36,7 +51,7 @@ const REDIS_LOCK_KEY = 'jestermaxing:signaling:lock';
 // Local development fallback. Vercel instances do not share process memory,
 // so production requires the shared Redis store configured above.
 const globalStore = globalThis as unknown as { __jesterDb?: Database };
-const localStore: Database = (globalStore.__jesterDb ??= { rooms: [], participants: [] });
+const localStore: Database = (globalStore.__jesterDb ??= { rooms: [], participants: [], intros: [] });
 
 async function acquireLock() {
   if (!redis) return null;
@@ -72,6 +87,9 @@ export async function withDatabase<T>(
         'Redis is not configured. Set UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN.',
       );
     }
+    // Guards against a dev-server hot reload keeping an older globalThis
+    // object around from before a field (e.g. `intros`) was added here.
+    localStore.intros ??= [];
     return operation({ data: localStore });
   }
 
@@ -80,7 +98,9 @@ export async function withDatabase<T>(
     const data = (await redis.get<Database>(REDIS_DATA_KEY)) ?? {
       rooms: [],
       participants: [],
+      intros: [],
     };
+    data.intros ??= [];
     const result = await operation({ data });
     await redis.set(REDIS_DATA_KEY, data, { ex: 60 * 60 });
     return result;
