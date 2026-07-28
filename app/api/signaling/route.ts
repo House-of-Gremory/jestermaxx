@@ -82,13 +82,21 @@ export async function POST(request: Request) {
       room.participantIds.push(participant.id);
       database.data.participants.push(participant);
 
-      if (existingParticipant) existingParticipant.messages.push({ type: 'peer-joined' });
+      if (existingParticipant) {
+        existingParticipant.messages.push({
+          type: 'peer-joined',
+          payload: { username },
+        });
+      }
 
       return Response.json({
         roomId: room.id,
         participantId: participant.id,
         username,
         waiting: room.participantIds.length === 1,
+        // Lets the second joiner show the first joiner's intro reel
+        // immediately, without waiting on a signaling round trip.
+        opponentUsername: existingParticipant?.username,
       });
     }
 

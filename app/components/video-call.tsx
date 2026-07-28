@@ -1,39 +1,23 @@
 'use client';
 
 import Link from 'next/link';
+import { useRouter } from 'next/navigation';
 import { type FormEvent, useCallback, useEffect, useRef, useState } from 'react';
 import { useLaughDetector } from '../lib/laugh/use-laugh-detector';
 import type { LaughEvent } from '../lib/laugh/types';
+import IntroPlayback from './intro-playback';
+import { fetchIntro, loadCachedIntro, saveCachedIntro } from '../lib/intro-cache';
+import { loadSavedUsername, saveUsername } from '../lib/username';
+import type { IntroRecordResolved } from '../../lib/intro-templates';
 
 type SignalMessage =
-  | { type: 'peer-joined' | 'bye' }
+  | { type: 'peer-joined'; payload: { username: string } }
+  | { type: 'bye' }
   | { type: 'offer' | 'answer'; payload: RTCSessionDescriptionInit }
   | { type: 'candidate'; payload: RTCIceCandidateInit }
   | { type: 'laugh'; payload: LaughEvent };
 
 const FALLBACK_ICE_SERVERS: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }];
-
-// Persist the chosen name in the browser until a real user/DB exists, so it
-// prefills on the next visit. Client-only, no account, no server.
-const USERNAME_STORAGE_KEY = 'jestermaxx:username';
-
-function loadSavedUsername(): string {
-  if (typeof window === 'undefined') return '';
-  try {
-    return window.localStorage.getItem(USERNAME_STORAGE_KEY) ?? '';
-  } catch {
-    return '';
-  }
-}
-
-function saveUsername(name: string) {
-  if (typeof window === 'undefined') return;
-  try {
-    window.localStorage.setItem(USERNAME_STORAGE_KEY, name);
-  } catch {
-    // Storage can be unavailable (private mode / blocked) — non-fatal.
-  }
-}
 
 // How often the client polls for signaling messages. Lower = faster handshake
 // (and faster ghost cleanup, since each poll refreshes lastSeen) at the cost of
@@ -76,9 +60,17 @@ async function getLocalStream(
 }
 
 export default function VideoCall() {
+  const router = useRouter();
   const [usernameInput, setUsernameInput] = useState('');
   const [username, setUsername] = useState('');
   const [status, setStatus] = useState('');
+  // The opponent's intro reel, played in the opponent tile in place of a
+  // loading screen until the real remote video connects. Never our own.
+  const [opponentIntroRecord, setOpponentIntroRecord] = useState<IntroRecordResolved | null>(null);
+  // Whether that reel has played all the way through at least once. The
+  // switch to real video waits on this too, so a fast connection never cuts
+  // the intro off mid-loop.
+  const [introHasPlayed, setIntroHasPlayed] = useState(false);
   // Bumping this re-runs the connection effect without leaving the call screen,
   // which is how "Next player" tears down the current peer and finds a new one.
   const [sessionId, setSessionId] = useState(0);
@@ -167,6 +159,14 @@ export default function VideoCall() {
     // Expose a laugh sender to the detector callback living in component scope.
     sendLaughRef.current = (event: LaughEvent) => void sendSignal({ type: 'laugh', payload: event });
 
+    // Looks up the opponent's saved intro reel (cache first) as soon as we
+    // know who they are, so their reel — not our own — plays while we wait.
+    async function loadOpponentIntro(opponentUsername: string) {
+      const cached = loadCachedIntro(opponentUsername);
+      const intro = cached ?? (await fetchIntro(opponentUsername));
+      if (intro) setOpponentIntroRecord(intro);
+    }
+
     async function createOffer() {
       const peerConnection = peerConnectionRef.current;
       if (!peerConnection) return;
@@ -198,6 +198,7 @@ export default function VideoCall() {
         // The first person in every room is the caller. When the second person
         // joins, only that first person receives this event and creates offer.
         setStatus('Opponent found. Connecting…');
+        void loadOpponentIntro(message.payload.username);
         await createOffer();
       } else if (message.type === 'offer') {
         await peerConnection.setRemoteDescription(message.payload);
@@ -217,8 +218,10 @@ export default function VideoCall() {
           pendingCandidatesRef.current.push(message.payload);
         }
       } else if (message.type === 'bye') {
-        // Opponent left the call. Clear their video and prompt to find a new one.
+        // Opponent left the call. Clear their video/intro and prompt for a new one.
         setConnected(false);
+        setOpponentIntroRecord(null);
+        setIntroHasPlayed(false);
         if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
         setStatus('Opponent left. Tap “Next player” to find someone new.');
       } else if (message.type === 'laugh') {
@@ -265,6 +268,8 @@ export default function VideoCall() {
       setConnected(false);
       setYouLaughed(0);
       setOppLaughed(0);
+      setOpponentIntroRecord(null);
+      setIntroHasPlayed(false);
       try {
         setStatus('Finding an opponent…');
         const joinResponse = await fetch('/api/signaling', {
@@ -288,9 +293,11 @@ export default function VideoCall() {
           roomId: string;
           participantId: string;
           waiting: boolean;
+          opponentUsername?: string;
         };
         roomIdRef.current = joinData.roomId;
         participantIdRef.current = joinData.participantId;
+        if (joinData.opponentUsername) void loadOpponentIntro(joinData.opponentUsername);
 
         setStatus('Requesting camera and microphone…');
         // On Windows a single physical webcam is often locked by the first tab,
@@ -372,10 +379,25 @@ export default function VideoCall() {
     };
   }, [username, sessionId]);
 
-  function joinCall(event: FormEvent<HTMLFormElement>) {
+  // An intro reel is mandatory before joining: check the local cache first,
+  // then fall back to the server (covers a new device/tab). If none exists
+  // yet, send the player to build one and come straight back here after.
+  async function joinCall(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const name = usernameInput.trim().slice(0, 32);
+    if (!name) return;
     saveUsername(name); // remember for next visit until a real DB exists
+
+    // Only gates entry — the fetched record itself is never shown, since we
+    // only ever display the opponent's intro reel, never our own.
+    const cached = loadCachedIntro(name);
+    const intro = cached ?? (await fetchIntro(name));
+    if (!intro) {
+      router.push(`/intro?username=${encodeURIComponent(name)}&next=/arena`);
+      return;
+    }
+    if (!cached) saveCachedIntro(name, intro);
+
     setUsername(name);
   }
 
@@ -393,6 +415,8 @@ export default function VideoCall() {
     excludeRoomIdRef.current = null;
     setStatus('');
     setUsername('');
+    setOpponentIntroRecord(null);
+    setIntroHasPlayed(false);
   }
 
   return (
@@ -489,6 +513,15 @@ export default function VideoCall() {
                 label="Opponent"
                 videoRef={remoteVideoRef}
                 placeholder={!connected}
+                overlay={
+                  (!connected || !introHasPlayed) && opponentIntroRecord ? (
+                    <IntroPlayback
+                      slides={opponentIntroRecord.slides}
+                      transitionId={opponentIntroRecord.transitionId}
+                      onCycleComplete={() => setIntroHasPlayed(true)}
+                    />
+                  ) : undefined
+                }
                 flashing={oppFlash}
                 badge={oppFlash ? '😂 laughed!' : undefined}
               />
@@ -526,6 +559,7 @@ function VideoTile({
   mirrored = false,
   muted = false,
   placeholder = false,
+  overlay,
   flashing = false,
   badge,
 }: {
@@ -535,6 +569,7 @@ function VideoTile({
   mirrored?: boolean;
   muted?: boolean;
   placeholder?: boolean;
+  overlay?: React.ReactNode;
   flashing?: boolean;
   badge?: string;
 }) {
@@ -559,10 +594,14 @@ function VideoTile({
           style={mirrored ? { transform: 'scaleX(-1)' } : undefined}
         />
       )}
-      {placeholder && (
-        <div className="absolute inset-0 flex items-center justify-center text-4xl text-white/20">
-          🃏
-        </div>
+      {overlay ? (
+        <div className="absolute inset-0">{overlay}</div>
+      ) : (
+        placeholder && (
+          <div className="absolute inset-0 flex items-center justify-center text-4xl text-white/20">
+            🃏
+          </div>
+        )
       )}
       <span className="absolute bottom-3 left-3 rounded-md bg-black/60 px-2 py-1 text-[11px] font-bold uppercase tracking-widest text-white/80">
         {label}
