@@ -19,4 +19,19 @@ export type LaughEvent = {
   detectorVersion: string;
 };
 
+export type FaceFeatures = {
+  smile: number; // 0..1, average of mouthSmileLeft/Right blendshapes
+  jawOpen: number; // 0..1
+  eyeSquint: number; // 0..1, average of cheekSquintLeft/Right
+};
+
+// Normalized [0..1] face box used only to draw the subtle tracking overlay.
+export type FaceBox = { x: number; y: number; w: number; h: number };
+
+export type FaceSample = {
+  faceAvailable: boolean;
+  features?: FaceFeatures;
+  box?: FaceBox;
+};
+
 export type LaughDetectorStatus = 'idle' | 'listening' | 'unavailable' | 'stopped';
