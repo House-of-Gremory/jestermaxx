@@ -93,6 +93,7 @@ export default function VideoCall() {
 
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
+  const faceOverlayRef = useRef<HTMLCanvasElement>(null);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const participantIdRef = useRef<string | null>(null);
@@ -113,8 +114,10 @@ export default function VideoCall() {
     sendLaughRef.current?.(event);
   }, []);
 
-  const { status: laughStatus, recentLaugh } = useLaughDetector({
+  const { status: laughStatus, recentLaugh, faceAvailable } = useLaughDetector({
     stream: localStream,
+    videoRef: localVideoRef,
+    overlayRef: faceOverlayRef,
     enabled: Boolean(username),
     onLaugh: handleLocalLaugh,
   });
@@ -448,18 +451,19 @@ export default function VideoCall() {
               {status}
             </p>
 
-            {/* Scoreboard: you win by making the opponent laugh. */}
+            {/* Scoreboard: you score by making the opponent laugh; if YOU laugh,
+                the point goes to them. */}
             <div className="mx-auto mb-4 flex w-full max-w-md items-stretch gap-3 text-center">
               <div className="flex-1 rounded-xl border border-lime-400/30 bg-lime-400/10 px-4 py-3">
                 <div className="text-2xl font-black text-lime-400">{oppLaughed}</div>
                 <div className="text-[10px] font-bold uppercase tracking-widest text-white/50">
-                  You made them laugh
+                  Your points · they laughed
                 </div>
               </div>
               <div className="flex-1 rounded-xl border border-fuchsia-500/30 bg-fuchsia-500/10 px-4 py-3">
                 <div className="text-2xl font-black text-fuchsia-400">{youLaughed}</div>
                 <div className="text-[10px] font-bold uppercase tracking-widest text-white/50">
-                  You laughed
+                  You cracked · point to them
                 </div>
               </div>
             </div>
@@ -471,8 +475,15 @@ export default function VideoCall() {
                 mirrored
                 muted
                 videoRef={localVideoRef}
+                overlayRef={faceOverlayRef}
                 flashing={recentLaugh}
-                badge={laughStatus === 'listening' ? '🎤 detecting' : undefined}
+                badge={
+                  faceAvailable
+                    ? '👁 tracking'
+                    : laughStatus === 'listening'
+                      ? '🎤 detecting'
+                      : undefined
+                }
               />
               <VideoTile
                 label="Opponent"
@@ -511,6 +522,7 @@ export default function VideoCall() {
 function VideoTile({
   label,
   videoRef,
+  overlayRef,
   mirrored = false,
   muted = false,
   placeholder = false,
@@ -519,6 +531,7 @@ function VideoTile({
 }: {
   label: string;
   videoRef: React.RefObject<HTMLVideoElement | null>;
+  overlayRef?: React.RefObject<HTMLCanvasElement | null>;
   mirrored?: boolean;
   muted?: boolean;
   placeholder?: boolean;
@@ -539,6 +552,13 @@ function VideoTile({
         className="h-full w-full object-cover"
         style={mirrored ? { transform: 'scaleX(-1)' } : undefined}
       />
+      {overlayRef && (
+        <canvas
+          ref={overlayRef}
+          className="pointer-events-none absolute inset-0 h-full w-full"
+          style={mirrored ? { transform: 'scaleX(-1)' } : undefined}
+        />
+      )}
       {placeholder && (
         <div className="absolute inset-0 flex items-center justify-center text-4xl text-white/20">
           🃏
