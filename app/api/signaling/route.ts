@@ -43,7 +43,7 @@ export async function POST(request: Request) {
     excludeRoomId?: string;
   };
 
-  return withDatabase((database) => {
+  return await withDatabase((database) => {
     removeExpiredParticipants(database);
 
     if (body.action === 'join') {
@@ -129,7 +129,7 @@ export async function GET(request: Request) {
   const roomId = url.searchParams.get('roomId');
   const participantId = url.searchParams.get('participantId');
 
-  return withDatabase((database) => {
+  return await withDatabase((database) => {
     removeExpiredParticipants(database);
     const participant = database.data.participants.find(
       (candidate) => candidate.id === participantId && candidate.roomId === roomId,

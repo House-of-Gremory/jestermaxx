@@ -1,14 +1,39 @@
 'use client';
 
 import Link from 'next/link';
-import { type FormEvent, useEffect, useRef, useState } from 'react';
+import { type FormEvent, useCallback, useEffect, useRef, useState } from 'react';
+import { useLaughDetector } from '../lib/laugh/use-laugh-detector';
+import type { LaughEvent } from '../lib/laugh/types';
 
 type SignalMessage =
   | { type: 'peer-joined' | 'bye' }
   | { type: 'offer' | 'answer'; payload: RTCSessionDescriptionInit }
-  | { type: 'candidate'; payload: RTCIceCandidateInit };
+  | { type: 'candidate'; payload: RTCIceCandidateInit }
+  | { type: 'laugh'; payload: LaughEvent };
 
 const FALLBACK_ICE_SERVERS: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }];
+
+// Persist the chosen name in the browser until a real user/DB exists, so it
+// prefills on the next visit. Client-only, no account, no server.
+const USERNAME_STORAGE_KEY = 'jestermaxx:username';
+
+function loadSavedUsername(): string {
+  if (typeof window === 'undefined') return '';
+  try {
+    return window.localStorage.getItem(USERNAME_STORAGE_KEY) ?? '';
+  } catch {
+    return '';
+  }
+}
+
+function saveUsername(name: string) {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(USERNAME_STORAGE_KEY, name);
+  } catch {
+    // Storage can be unavailable (private mode / blocked) — non-fatal.
+  }
+}
 
 // How often the client polls for signaling messages. Lower = faster handshake
 // (and faster ghost cleanup, since each poll refreshes lastSeen) at the cost of
@@ -58,6 +83,13 @@ export default function VideoCall() {
   // which is how "Next player" tears down the current peer and finds a new one.
   const [sessionId, setSessionId] = useState(0);
   const [connected, setConnected] = useState(false);
+  // Laugh scoring. `oppLaughed` = times the opponent laughed = YOUR score (you
+  // made them laugh). `youLaughed` = times you laughed. The local stream is kept
+  // in state so the laugh detector hook can attach to its audio track.
+  const [localStream, setLocalStream] = useState<MediaStream | null>(null);
+  const [youLaughed, setYouLaughed] = useState(0);
+  const [oppLaughed, setOppLaughed] = useState(0);
+  const [oppFlash, setOppFlash] = useState(false);
 
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
@@ -70,13 +102,37 @@ export default function VideoCall() {
   const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   // The room a "Next player" click is leaving, so the server won't rematch it.
   const excludeRoomIdRef = useRef<string | null>(null);
+  // Bridges the laugh detector (component scope) to sendSignal (effect scope).
+  const sendLaughRef = useRef<((event: LaughEvent) => void) | null>(null);
+  const oppFlashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Called when YOUR laugh is confirmed: count it and tell the opponent so their
+  // score goes up. Only this compact event is sent — never audio or features.
+  const handleLocalLaugh = useCallback((event: LaughEvent) => {
+    setYouLaughed((value) => value + 1);
+    sendLaughRef.current?.(event);
+  }, []);
+
+  const { status: laughStatus, recentLaugh } = useLaughDetector({
+    stream: localStream,
+    enabled: Boolean(username),
+    onLaugh: handleLocalLaugh,
+  });
+
+  // Prefill the previously saved name on first load (deferred so it isn't a
+  // synchronous setState in the effect body, and avoids a hydration mismatch).
+  useEffect(() => {
+    const saved = loadSavedUsername();
+    if (!saved) return;
+    const timer = setTimeout(() => setUsernameInput(saved), 0);
+    return () => clearTimeout(timer);
+  }, []);
 
   useEffect(() => {
     if (!username) return;
 
     stoppedRef.current = false;
     pendingCandidatesRef.current = [];
-    setConnected(false);
     if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
 
     async function sendSignal(message: SignalMessage) {
@@ -104,6 +160,9 @@ export default function VideoCall() {
     }
 
     window.addEventListener('pagehide', sendByeBeacon);
+
+    // Expose a laugh sender to the detector callback living in component scope.
+    sendLaughRef.current = (event: LaughEvent) => void sendSignal({ type: 'laugh', payload: event });
 
     async function createOffer() {
       const peerConnection = peerConnectionRef.current;
@@ -159,6 +218,12 @@ export default function VideoCall() {
         setConnected(false);
         if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
         setStatus('Opponent left. Tap “Next player” to find someone new.');
+      } else if (message.type === 'laugh') {
+        // The opponent's browser confirmed a laugh -> you scored. Flash their tile.
+        setOppLaughed((value) => value + 1);
+        setOppFlash(true);
+        if (oppFlashTimerRef.current) clearTimeout(oppFlashTimerRef.current);
+        oppFlashTimerRef.current = setTimeout(() => setOppFlash(false), 1200);
       }
     }
 
@@ -194,6 +259,9 @@ export default function VideoCall() {
     }
 
     async function start() {
+      setConnected(false);
+      setYouLaughed(0);
+      setOppLaughed(0);
       try {
         setStatus('Finding an opponent…');
         const joinResponse = await fetch('/api/signaling', {
@@ -227,6 +295,7 @@ export default function VideoCall() {
         // two tabs on one machine (one real camera, one viewer) still connect.
         const stream = await getLocalStream(setStatus);
         localStreamRef.current = stream;
+        setLocalStream(stream); // hand the audio track to the laugh detector
         if (stream && localVideoRef.current) localVideoRef.current.srcObject = stream;
 
         const iceServers = await fetchIceServers();
@@ -294,12 +363,17 @@ export default function VideoCall() {
       peerConnectionRef.current = null;
       localStreamRef.current?.getTracks().forEach((track) => track.stop());
       localStreamRef.current = null;
+      sendLaughRef.current = null;
+      if (oppFlashTimerRef.current) clearTimeout(oppFlashTimerRef.current);
+      setLocalStream(null); // stops the laugh detector (its effect re-runs)
     };
   }, [username, sessionId]);
 
   function joinCall(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    setUsername(usernameInput.trim().slice(0, 32));
+    const name = usernameInput.trim().slice(0, 32);
+    saveUsername(name); // remember for next visit until a real DB exists
+    setUsername(name);
   }
 
   // Leave the current opponent and immediately look for a different one. The
@@ -374,11 +448,44 @@ export default function VideoCall() {
               {status}
             </p>
 
+            {/* Scoreboard: you win by making the opponent laugh. */}
+            <div className="mx-auto mb-4 flex w-full max-w-md items-stretch gap-3 text-center">
+              <div className="flex-1 rounded-xl border border-lime-400/30 bg-lime-400/10 px-4 py-3">
+                <div className="text-2xl font-black text-lime-400">{oppLaughed}</div>
+                <div className="text-[10px] font-bold uppercase tracking-widest text-white/50">
+                  You made them laugh
+                </div>
+              </div>
+              <div className="flex-1 rounded-xl border border-fuchsia-500/30 bg-fuchsia-500/10 px-4 py-3">
+                <div className="text-2xl font-black text-fuchsia-400">{youLaughed}</div>
+                <div className="text-[10px] font-bold uppercase tracking-widest text-white/50">
+                  You laughed
+                </div>
+              </div>
+            </div>
+
             {/* Side-by-side video tiles (stack on small screens) */}
             <div className="grid flex-1 gap-4 md:grid-cols-2">
-              <VideoTile label="You" mirrored muted videoRef={localVideoRef} />
-              <VideoTile label="Opponent" videoRef={remoteVideoRef} placeholder={!connected} />
+              <VideoTile
+                label="You"
+                mirrored
+                muted
+                videoRef={localVideoRef}
+                flashing={recentLaugh}
+                badge={laughStatus === 'listening' ? '🎤 detecting' : undefined}
+              />
+              <VideoTile
+                label="Opponent"
+                videoRef={remoteVideoRef}
+                placeholder={!connected}
+                flashing={oppFlash}
+                badge={oppFlash ? '😂 laughed!' : undefined}
+              />
             </div>
+
+            <p className="mt-3 text-center text-[11px] text-white/30">
+              🔒 Audio is analyzed on your device to detect laughs — never recorded or uploaded.
+            </p>
 
             <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
               <button
@@ -407,15 +514,23 @@ function VideoTile({
   mirrored = false,
   muted = false,
   placeholder = false,
+  flashing = false,
+  badge,
 }: {
   label: string;
   videoRef: React.RefObject<HTMLVideoElement | null>;
   mirrored?: boolean;
   muted?: boolean;
   placeholder?: boolean;
+  flashing?: boolean;
+  badge?: string;
 }) {
   return (
-    <div className="relative aspect-video w-full overflow-hidden rounded-2xl border border-white/10 bg-black">
+    <div
+      className={`relative aspect-video w-full overflow-hidden rounded-2xl border bg-black transition-colors duration-200 ${
+        flashing ? 'border-lime-400 shadow-[0_0_30px_rgba(163,230,53,0.5)]' : 'border-white/10'
+      }`}
+    >
       <video
         ref={videoRef}
         autoPlay
@@ -432,6 +547,11 @@ function VideoTile({
       <span className="absolute bottom-3 left-3 rounded-md bg-black/60 px-2 py-1 text-[11px] font-bold uppercase tracking-widest text-white/80">
         {label}
       </span>
+      {badge && (
+        <span className="absolute right-3 top-3 rounded-md bg-black/70 px-2 py-1 text-[11px] font-bold uppercase tracking-widest text-lime-400">
+          {badge}
+        </span>
+      )}
     </div>
   );
 }
