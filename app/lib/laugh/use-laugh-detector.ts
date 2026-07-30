@@ -4,10 +4,19 @@ import { type RefObject, useEffect, useRef, useState } from 'react';
 import { AudioAnalyzer } from './audio-analyzer';
 import { FaceDetector } from './face-detector';
 import { LaughDetector } from './laugh-detector';
-import type { FaceBox, FaceSample, LaughDetectorStatus, LaughEvent } from './types';
+import type {
+  ExpressionLabel,
+  FaceBox,
+  FaceSample,
+  LaughDetectorStatus,
+  LaughEvent,
+} from './types';
 
 const AUDIO_FRAME_MS = 33; // ~30 Hz audio analysis
-const FACE_FRAME_MS = 66; // ~15 Hz face inference (heavier, throttled harder)
+const FACE_FRAME_MS = 120; // ~8 Hz face inference (heavier; light + spec §16)
+const EXPRESSION_THROTTLE_MS = 200; // limit expression re-renders to ~5 Hz
+const FACE_TIMEOUT_MS = 12_000; // no face this long -> fairness penalty
+const PENALTY_POINTS = 3; // points to the opponent when you hide your face
 
 // Drives the fused laugh detector off the existing local media. Audio runs every
 // frame; face inference runs at a lower rate and its latest sample is reused by
@@ -25,10 +34,16 @@ export function useLaughDetector({
   overlayRef: RefObject<HTMLCanvasElement | null>;
   enabled: boolean;
   onLaugh?: (event: LaughEvent) => void;
-}): { status: LaughDetectorStatus; recentLaugh: boolean; faceAvailable: boolean } {
+}): {
+  status: LaughDetectorStatus;
+  recentLaugh: boolean;
+  faceAvailable: boolean;
+  expression: ExpressionLabel;
+} {
   const [status, setStatus] = useState<LaughDetectorStatus>('idle');
   const [recentLaugh, setRecentLaugh] = useState(false);
   const [faceAvailable, setFaceAvailable] = useState(false);
+  const [expression, setExpression] = useState<ExpressionLabel>('no-face');
 
   const onLaughRef = useRef(onLaugh);
   useEffect(() => {
@@ -62,6 +77,10 @@ export function useLaughDetector({
     let announced = false;
     let latestFace: FaceSample | null = null;
     let faceFlag = false;
+    let lastFaceSeenAt = 0; // 0 until the model is ready and monitoring starts
+    let penalized = false;
+    let lastExprAt = 0;
+    let lastExpr: ExpressionLabel | null = null;
     let flashTimer: ReturnType<typeof setTimeout> | null = null;
 
     const drawOverlay = (box?: FaceBox) => {
@@ -109,14 +128,33 @@ export function useLaughDetector({
       // Face inference (throttled) refreshes the shared sample + overlay.
       if (faceDetector.ready && t - lastFace >= FACE_FRAME_MS && videoRef.current) {
         lastFace = t;
+        if (lastFaceSeenAt === 0) lastFaceSeenAt = t; // start monitoring once ready
         const sample = faceDetector.detect(videoRef.current, t);
         if (sample) {
           latestFace = sample;
           drawOverlay(sample.faceAvailable ? sample.box : undefined);
+          if (sample.faceAvailable) {
+            lastFaceSeenAt = t;
+            penalized = false;
+          }
           if (sample.faceAvailable !== faceFlag) {
             faceFlag = sample.faceAvailable;
             setFaceAvailable(faceFlag);
           }
+        }
+        // Fairness: face hidden too long -> award penalty points to the opponent
+        // (once, until the face returns). Discourages hiding to avoid laughing.
+        if (!penalized && t - lastFaceSeenAt >= FACE_TIMEOUT_MS) {
+          penalized = true;
+          onLaughRef.current?.({
+            clientEventId: crypto.randomUUID(),
+            occurredAt: Date.now(),
+            durationMs: FACE_TIMEOUT_MS,
+            confidence: 1,
+            detectorVersion: 'face-timeout',
+            reason: 'face-timeout',
+            points: PENALTY_POINTS,
+          });
         }
       }
 
@@ -128,12 +166,18 @@ export function useLaughDetector({
           setStatus('listening');
         }
         const face = latestFace?.faceAvailable ? (latestFace.features ?? null) : null;
-        const event = detector.update(analyzer.getFeatures(), face, t);
-        if (event) {
+        const tick = detector.update(analyzer.getFeatures(), face, t);
+        if (tick.event) {
           setRecentLaugh(true);
           if (flashTimer) clearTimeout(flashTimer);
           flashTimer = setTimeout(() => setRecentLaugh(false), 1200);
-          onLaughRef.current?.(event);
+          onLaughRef.current?.(tick.event);
+        }
+        // Surface the live label at a low rate, only when it changes.
+        if (tick.expression !== lastExpr && t - lastExprAt >= EXPRESSION_THROTTLE_MS) {
+          lastExpr = tick.expression;
+          lastExprAt = t;
+          setExpression(tick.expression);
         }
       }
     };
@@ -170,9 +214,10 @@ export function useLaughDetector({
       if (overlayCanvas && ctx) ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
       setRecentLaugh(false);
       setFaceAvailable(false);
+      setExpression('no-face');
       setStatus('stopped');
     };
   }, [stream, enabled, videoRef, overlayRef]);
 
-  return { status, recentLaugh, faceAvailable };
+  return { status, recentLaugh, faceAvailable, expression };
 }

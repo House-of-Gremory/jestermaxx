@@ -9,6 +9,8 @@ export type AudioFeatures = {
   highBandEnergy: number; // 0..1 share of energy above the voice fundamental
 };
 
+export type ScoreReason = 'laugh' | 'smile' | 'face-timeout' | 'mouth-cover';
+
 // The only object that crosses a boundary (to the opponent / a future server).
 // No media, no landmarks, no feature arrays — see LAUGH-DETECTION spec §8.
 export type LaughEvent = {
@@ -17,6 +19,8 @@ export type LaughEvent = {
   durationMs: number;
   confidence: number;
   detectorVersion: string;
+  reason: ScoreReason; // laugh, sustained-smile bonus, or face-not-shown penalty
+  points: number; // points awarded to the opponent for this event
 };
 
 export type FaceFeatures = {
@@ -32,6 +36,13 @@ export type FaceSample = {
   faceAvailable: boolean;
   features?: FaceFeatures;
   box?: FaceBox;
+  mouthBox?: FaceBox; // tight box around the mouth, for occlusion checks
 };
 
+// One detected hand as normalized [0..1] points (used to spot a hand over the mouth).
+export type HandPoint = { x: number; y: number };
+
 export type LaughDetectorStatus = 'idle' | 'listening' | 'unavailable' | 'stopped';
+
+// Coarse, honest labels only — this never claims to know a real emotion.
+export type ExpressionLabel = 'no-face' | 'neutral' | 'smiling' | 'possible-laughter';

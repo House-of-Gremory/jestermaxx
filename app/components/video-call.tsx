@@ -4,7 +4,22 @@ import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { type FormEvent, useCallback, useEffect, useRef, useState } from 'react';
 import { useLaughDetector } from '../lib/laugh/use-laugh-detector';
-import type { LaughEvent } from '../lib/laugh/types';
+import type { ExpressionLabel, LaughEvent, ScoreReason } from '../lib/laugh/types';
+
+// Live expression readout shown on the local tile — coarse, honest labels only.
+const EXPRESSION_BADGE: Record<ExpressionLabel, string> = {
+  'no-face': '👁 no face',
+  neutral: '😐 neutral',
+  smiling: '🙂 smiling',
+  'possible-laughter': '😂 laughing?',
+};
+
+// Short toast text for a scoring event, shown briefly beside the counter.
+function reasonLabel(reason: ScoreReason, points: number): string {
+  if (reason === 'smile') return `🙂 smile bonus +${points}`;
+  if (reason === 'face-timeout') return `🙈 no-show +${points}`;
+  return `😂 +${points}`;
+}
 import IntroPlayback from './intro-playback';
 import { fetchIntro, loadCachedIntro, saveCachedIntro } from '../lib/intro-cache';
 import { loadSavedUsername, saveUsername } from '../lib/username';
@@ -36,15 +51,34 @@ async function fetchIceServers(): Promise<RTCIceServer[]> {
   }
 }
 
+// Moderate video keeps bandwidth (and TURN relay cost) low: 640x480@24 is far
+// cheaper than the browser's 720p/1080p default and also lighter/smoother. Audio
+// gets the standard voice cleanups.
+const VIDEO_CONSTRAINTS: MediaTrackConstraints = {
+  width: { ideal: 640 },
+  height: { ideal: 480 },
+  frameRate: { ideal: 24, max: 30 },
+  facingMode: 'user',
+};
+const AUDIO_CONSTRAINTS: MediaTrackConstraints = {
+  echoCancellation: true,
+  noiseSuppression: true,
+  autoGainControl: true,
+};
+
+// Cap the video encoder's bitrate so a relayed (TURN) call can't balloon. ~450
+// kbps is plenty for 640x480 talking-head video.
+const MAX_VIDEO_BITRATE = 450_000;
+
 // Try progressively weaker media constraints so a locked/absent camera does not
 // abort the call. Returns null when no device is usable (view-only participant).
 async function getLocalStream(
   setStatus: (message: string) => void,
 ): Promise<MediaStream | null> {
   const attempts: MediaStreamConstraints[] = [
-    { video: true, audio: true },
-    { video: true, audio: false },
-    { video: false, audio: true },
+    { video: VIDEO_CONSTRAINTS, audio: AUDIO_CONSTRAINTS },
+    { video: VIDEO_CONSTRAINTS, audio: false },
+    { video: false, audio: AUDIO_CONSTRAINTS },
   ];
 
   for (const constraints of attempts) {
@@ -82,6 +116,8 @@ export default function VideoCall() {
   const [youLaughed, setYouLaughed] = useState(0);
   const [oppLaughed, setOppLaughed] = useState(0);
   const [oppFlash, setOppFlash] = useState(false);
+  const [youToast, setYouToast] = useState<string | null>(null);
+  const [oppToast, setOppToast] = useState<string | null>(null);
 
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
@@ -98,19 +134,26 @@ export default function VideoCall() {
   // Bridges the laugh detector (component scope) to sendSignal (effect scope).
   const sendLaughRef = useRef<((event: LaughEvent) => void) | null>(null);
   const oppFlashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const youToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const oppToastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Called when YOUR laugh is confirmed: count it and tell the opponent so their
-  // score goes up. Only this compact event is sent — never audio or features.
+  // Called when YOUR scoring event fires (laugh, smile bonus, or face-timeout):
+  // count it against you, flash a toast, and tell the opponent so their score
+  // goes up. Only this compact event is sent — never audio or features.
   const handleLocalLaugh = useCallback((event: LaughEvent) => {
-    setYouLaughed((value) => value + 1);
+    setYouLaughed((value) => value + event.points);
+    setYouToast(reasonLabel(event.reason, event.points));
+    if (youToastTimerRef.current) clearTimeout(youToastTimerRef.current);
+    youToastTimerRef.current = setTimeout(() => setYouToast(null), 1600);
     sendLaughRef.current?.(event);
   }, []);
 
-  const { status: laughStatus, recentLaugh, faceAvailable } = useLaughDetector({
+  const { status: laughStatus, recentLaugh, faceAvailable, expression } = useLaughDetector({
     stream: localStream,
     videoRef: localVideoRef,
     overlayRef: faceOverlayRef,
-    enabled: Boolean(username),
+    // Only detect/score while actually matched and connected to an opponent.
+    enabled: connected,
     onLaugh: handleLocalLaugh,
   });
 
@@ -225,8 +268,12 @@ export default function VideoCall() {
         if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
         setStatus('Opponent left. Tap “Next player” to find someone new.');
       } else if (message.type === 'laugh') {
-        // The opponent's browser confirmed a laugh -> you scored. Flash their tile.
-        setOppLaughed((value) => value + 1);
+        // The opponent's browser scored an event -> you gain the points.
+        const scored = message.payload;
+        setOppLaughed((value) => value + scored.points);
+        setOppToast(reasonLabel(scored.reason, scored.points));
+        if (oppToastTimerRef.current) clearTimeout(oppToastTimerRef.current);
+        oppToastTimerRef.current = setTimeout(() => setOppToast(null), 1600);
         setOppFlash(true);
         if (oppFlashTimerRef.current) clearTimeout(oppFlashTimerRef.current);
         oppFlashTimerRef.current = setTimeout(() => setOppFlash(false), 1200);
@@ -268,6 +315,8 @@ export default function VideoCall() {
       setConnected(false);
       setYouLaughed(0);
       setOppLaughed(0);
+      setYouToast(null);
+      setOppToast(null);
       setOpponentIntroRecord(null);
       setIntroHasPlayed(false);
       try {
@@ -319,6 +368,22 @@ export default function VideoCall() {
         // camera-less viewer still negotiates to receive the other player.
         if (!haveVideo) peerConnection.addTransceiver('video', { direction: 'recvonly' });
         if (!haveAudio) peerConnection.addTransceiver('audio', { direction: 'recvonly' });
+
+        // Cap the outgoing video bitrate so a TURN-relayed call stays cheap.
+        if (haveVideo) {
+          const videoSender = peerConnection
+            .getSenders()
+            .find((sender) => sender.track?.kind === 'video');
+          if (videoSender) {
+            const params = videoSender.getParameters();
+            if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
+            params.encodings[0].maxBitrate = MAX_VIDEO_BITRATE;
+            params.encodings[0].maxFramerate = 30;
+            void videoSender.setParameters(params).catch(() => {
+              // Non-fatal: some browsers reject mid-negotiation; bitrate stays default.
+            });
+          }
+        }
 
         peerConnection.ontrack = (event) => {
           setConnected(true);
@@ -375,6 +440,8 @@ export default function VideoCall() {
       localStreamRef.current = null;
       sendLaughRef.current = null;
       if (oppFlashTimerRef.current) clearTimeout(oppFlashTimerRef.current);
+      if (youToastTimerRef.current) clearTimeout(youToastTimerRef.current);
+      if (oppToastTimerRef.current) clearTimeout(oppToastTimerRef.current);
       setLocalStream(null); // stops the laugh detector (its effect re-runs)
     };
   }, [username, sessionId]);
@@ -478,14 +545,24 @@ export default function VideoCall() {
             {/* Scoreboard: you score by making the opponent laugh; if YOU laugh,
                 the point goes to them. */}
             <div className="mx-auto mb-4 flex w-full max-w-md items-stretch gap-3 text-center">
-              <div className="flex-1 rounded-xl border border-lime-400/30 bg-lime-400/10 px-4 py-3">
+              <div className="relative flex-1 rounded-xl border border-lime-400/30 bg-lime-400/10 px-4 py-3">
+                {oppToast && (
+                  <span className="absolute -top-3 left-1/2 -translate-x-1/2 animate-pulse whitespace-nowrap rounded-full bg-lime-400 px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest text-black shadow-lg">
+                    {oppToast}
+                  </span>
+                )}
                 <div className="text-2xl font-black text-lime-400">{oppLaughed}</div>
                 <div className="text-[10px] font-bold uppercase tracking-widest text-white/50">
-                  Your points · they laughed
+                  Your points · they cracked
                 </div>
               </div>
-              <div className="flex-1 rounded-xl border border-fuchsia-500/30 bg-fuchsia-500/10 px-4 py-3">
-                <div className="text-2xl font-black text-fuchsia-400">{youLaughed}</div>
+              <div className="relative flex-1 rounded-xl border border-red-500/40 bg-red-500/10 px-4 py-3">
+                {youToast && (
+                  <span className="absolute -top-3 left-1/2 -translate-x-1/2 animate-pulse whitespace-nowrap rounded-full bg-red-500 px-2 py-0.5 text-[10px] font-bold uppercase tracking-widest text-white shadow-lg">
+                    {youToast}
+                  </span>
+                )}
+                <div className="text-2xl font-black text-red-400">{youLaughed}</div>
                 <div className="text-[10px] font-bold uppercase tracking-widest text-white/50">
                   You cracked · point to them
                 </div>
@@ -503,7 +580,7 @@ export default function VideoCall() {
                 flashing={recentLaugh}
                 badge={
                   faceAvailable
-                    ? '👁 tracking'
+                    ? EXPRESSION_BADGE[expression]
                     : laughStatus === 'listening'
                       ? '🎤 detecting'
                       : undefined

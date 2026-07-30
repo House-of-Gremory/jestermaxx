@@ -14,11 +14,29 @@ function loadVision() {
   return modulePromise;
 }
 
+// MediaPipe's WASM prints TFLite/XNNPACK init lines through console.error even
+// though they are informational (e.g. "INFO: Created TensorFlow Lite XNNPACK
+// delegate for CPU."). Next's dev overlay then shows them as "Console Error".
+// Filter only those known-benign lines; everything else passes through.
+let consolePatched = false;
+function silenceMediapipeInfoLogs() {
+  if (consolePatched || typeof window === 'undefined') return;
+  consolePatched = true;
+  const benign = /Created TensorFlow Lite XNNPACK delegate|^INFO:|GL version|gl_context/i;
+  const patch = (original: (...args: unknown[]) => void) => (...args: unknown[]) => {
+    if (typeof args[0] === 'string' && benign.test(args[0])) return;
+    original(...args);
+  };
+  console.error = patch(console.error.bind(console));
+  console.info = patch(console.info.bind(console));
+}
+
 export class FaceDetector {
   private landmarker: FaceLandmarker | null = null;
   private lastVideoTime = -1;
 
   async init(): Promise<void> {
+    silenceMediapipeInfoLogs();
     const vision = await loadVision();
     const fileset = await vision.FilesetResolver.forVisionTasks(WASM_BASE);
     this.landmarker = await vision.FaceLandmarker.createFromOptions(fileset, {

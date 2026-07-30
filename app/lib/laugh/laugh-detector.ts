@@ -1,202 +1,244 @@
-import type { AudioFeatures, FaceFeatures, LaughEvent } from './types';
+import type { AudioFeatures, ExpressionLabel, FaceFeatures, LaughEvent, ScoreReason } from './types';
 
-// Fused face + audio laugh detector (spec §7). A laugh is a temporal event, not a
-// per-frame boolean: a candidate must last long enough, stay active enough, show
-// real facial laughter cues, AND have audio energy before ONE event is emitted,
-// followed by a cooldown.
+// Fused face + audio laugh/smile detector, tuned to fire on real smiles and
+// laughs while resisting false positives.
 //
-// Competitive mode (face + audio present) is tight: a silent smile, a still open
-// mouth, or a random noise on their own will not confirm. When the face signal is
-// unavailable it falls back to an audio-only mode with stricter thresholds and
-// lower trust, so scoring degrades instead of breaking.
+// Smile scoring uses a HYSTERESIS state (a Schmitt trigger), not a fixed hold:
+//  - Smile turns ON when the smoothed smile crosses SMILE_ON.
+//  - It stays ON through brief dips/head movement, and only turns OFF after the
+//    smile stays below SMILE_OFF continuously for SMILE_CLEAR_MS (~2s).
+// This matches real behaviour (nobody holds a frozen grin) and stops the
+// neutral<->smile flicker. Each smile turning ON awards a light 0.5 point once;
+// a full laugh (smile + open jaw / squint / audio bursts) adds 1 on top.
 
-const DETECTOR_VERSION = 'face-audio-v1';
+const DETECTOR_VERSION = 'face-audio-v4';
 
-// Tunables — starting points, calibrate on real devices (spec §12).
-const CALIBRATION_MS = 800;
-const CANDIDATE_MIN_MS = 450;
-const CANDIDATE_MAX_MS = 4000;
-const END_BELOW_MS = 350;
-const COOLDOWN_MS = 2000;
-const ENERGY_RATIO_TRIGGER = 2.2;
-const EMA = 0.4;
+const CALIBRATION_MS = 700;
+const CANDIDATE_MIN_MS = 400;
+const CANDIDATE_MAX_MS = 5000;
+const END_BELOW_MS = 400;
+const COOLDOWN_MS = 1500; // min gap between LAUGH awards
+const ENERGY_RATIO_TRIGGER = 2.0;
+const AUDIO_EMA = 0.4;
+const FACE_EMA = 0.3; // heavier smoothing on face -> steadier smile signal
 
-// Face indicator thresholds (an "indicator" = one clear laughter cue).
-const SMILE_ON = 0.55;
-const JAW_ON = 0.25;
-const SQUINT_ON = 0.2;
+const JAW_ON = 0.22;
 
-// Confirmation gates.
-const FUSED_CONFIDENCE = 0.72;
-const FUSED_ACTIVE_RATIO = 0.35;
-const FUSED_FACE_INDICATORS = 2; // need >= 2 face cues at some point
-const AUDIO_ONLY_CONFIDENCE = 0.7;
-const AUDIO_ONLY_ACTIVE_RATIO = 0.45;
+// Smile hysteresis.
+const SMILE_ON = 0.42; // turn smiling ON
+const SMILE_OFF = 0.28; // must drop below this...
+const SMILE_CLEAR_MS = 2000; // ...for this long before smiling turns OFF
+const SMILE_POINTS = 0.5;
 
-type State = 'QUIET' | 'POSSIBLE' | 'COOLDOWN';
+// Laugh confirmation.
+const SMILE_PEAK_MIN = 0.45;
+const JAW_CUE = 0.18;
+const SQUINT_CUE = 0.22;
+const BURST_CUE = 2;
+const MIN_FACE_PRESENCE = 0.5;
+const CONFIRM_CONFIDENCE = 0.45;
+const LAUGH_POINTS = 1;
+
+type State = 'QUIET' | 'POSSIBLE';
 
 const clamp01 = (n: number) => (n < 0 ? 0 : n > 1 ? 1 : n);
+
+export type DetectorTick = {
+  event: LaughEvent | null;
+  expression: ExpressionLabel;
+  smiling: boolean;
+};
 
 export class LaughDetector {
   private state: State = 'QUIET';
   private startTs = 0;
   private calibrated = false;
   private noiseFloor = 1e-4;
+  private cooldownUntil = 0;
 
-  // smoothed features
   private sRms = 0;
   private sHigh = 0;
-  private sZcr = 0;
-  private prevRms = 0;
   private sSmile = 0;
   private sJaw = 0;
   private sSquint = 0;
-  private prevJaw = 0;
+  private prevActive = false;
 
-  // candidate accumulators
+  // smile hysteresis state
+  private smiling = false;
+  private neutralSince = 0;
+
+  // laugh candidate accumulators
   private candidateStart = 0;
   private belowSince = 0;
   private totalWindows = 0;
-  private audioActiveWindows = 0;
+  private faceWindows = 0;
   private combinedSum = 0;
-  private audioSum = 0;
-  private facePeakIndicators = 0;
-  private faceSeen = false;
+  private bursts = 0;
+  private smilePeak = 0;
+  private jawPeak = 0;
+  private squintPeak = 0;
 
   reset() {
     this.state = 'QUIET';
     this.startTs = 0;
     this.calibrated = false;
     this.noiseFloor = 1e-4;
-    this.sRms = this.sHigh = this.sZcr = this.prevRms = 0;
-    this.sSmile = this.sJaw = this.sSquint = this.prevJaw = 0;
+    this.cooldownUntil = 0;
+    this.sRms = this.sHigh = 0;
+    this.sSmile = this.sJaw = this.sSquint = 0;
+    this.prevActive = false;
+    this.smiling = false;
+    this.neutralSince = 0;
   }
 
-  update(audio: AudioFeatures, face: FaceFeatures | null, now: number): LaughEvent | null {
+  private makeEvent(reason: ScoreReason, points: number, durationMs: number, confidence: number): LaughEvent {
+    return {
+      clientEventId: crypto.randomUUID(),
+      occurredAt: Date.now(),
+      durationMs: Math.round(durationMs),
+      confidence: Math.round(confidence * 100) / 100,
+      detectorVersion: DETECTOR_VERSION,
+      reason,
+      points,
+    };
+  }
+
+  private expressionFor(hasFace: boolean, audioActive: boolean): ExpressionLabel {
+    if (!hasFace) return 'no-face';
+    if (!this.smiling) return 'neutral';
+    if (this.sJaw >= JAW_ON || audioActive) return 'possible-laughter';
+    return 'smiling';
+  }
+
+  update(audio: AudioFeatures, face: FaceFeatures | null, now: number): DetectorTick {
     if (!this.startTs) this.startTs = now;
 
-    // Smooth audio.
-    this.sRms = this.sRms ? this.sRms * (1 - EMA) + audio.rms * EMA : audio.rms;
-    this.sHigh = this.sHigh * (1 - EMA) + audio.highBandEnergy * EMA;
-    this.sZcr = this.sZcr * (1 - EMA) + audio.zcr * EMA;
-
-    // Smooth face (only when present; otherwise decay toward zero).
+    this.sRms = this.sRms ? this.sRms * (1 - AUDIO_EMA) + audio.rms * AUDIO_EMA : audio.rms;
+    this.sHigh = this.sHigh * (1 - AUDIO_EMA) + audio.highBandEnergy * AUDIO_EMA;
     if (face) {
-      this.sSmile = this.sSmile * (1 - EMA) + face.smile * EMA;
-      this.sJaw = this.sJaw * (1 - EMA) + face.jawOpen * EMA;
-      this.sSquint = this.sSquint * (1 - EMA) + face.eyeSquint * EMA;
+      this.sSmile = this.sSmile * (1 - FACE_EMA) + face.smile * FACE_EMA;
+      this.sJaw = this.sJaw * (1 - FACE_EMA) + face.jawOpen * FACE_EMA;
+      this.sSquint = this.sSquint * (1 - FACE_EMA) + face.eyeSquint * FACE_EMA;
     } else {
-      this.sSmile *= 0.8;
-      this.sJaw *= 0.8;
-      this.sSquint *= 0.8;
+      this.sSmile *= 0.85;
+      this.sJaw *= 0.85;
+      this.sSquint *= 0.85;
     }
 
-    // Calibrate noise floor from the first ~800ms of quiet.
+    const hasFace = face !== null;
+
     if (!this.calibrated) {
       this.noiseFloor = Math.max(this.noiseFloor * 0.9 + this.sRms * 0.1, 1e-5);
       if (now - this.startTs >= CALIBRATION_MS) this.calibrated = true;
-      return null;
+      return { event: null, expression: this.expressionFor(hasFace, false), smiling: this.smiling };
     }
     if (this.sRms < this.noiseFloor * 1.5) {
       this.noiseFloor = this.noiseFloor * 0.995 + this.sRms * 0.005;
     }
 
-    // ---- per-window scores ----
     const energyRatio = this.sRms / Math.max(this.noiseFloor, 1e-6);
-    const rmsDelta = Math.abs(this.sRms - this.prevRms);
-    this.prevRms = this.sRms;
-
-    const energyScore = clamp01((energyRatio - 1) / (ENERGY_RATIO_TRIGGER * 2));
-    const highScore = clamp01(this.sHigh / 0.5);
-    const zcrScore = clamp01((this.sZcr - 0.05) / 0.25);
-    const rhythmScore = clamp01(rmsDelta / (this.noiseFloor * 3));
-    const audioScore = clamp01(
-      0.45 * energyScore + 0.2 * highScore + 0.15 * zcrScore + 0.2 * rhythmScore,
-    );
-
-    const jawDelta = Math.abs(this.sJaw - this.prevJaw);
-    this.prevJaw = this.sJaw;
-    const smileScore = clamp01((this.sSmile - 0.2) / 0.6);
-    const mouthOpenScore = clamp01((this.sJaw - 0.15) / 0.5);
-    const mouthActivityScore = clamp01(jawDelta / 0.1);
-    const mouthScore = Math.max(mouthOpenScore * 0.7, mouthActivityScore);
-    const squintScore = clamp01((this.sSquint - 0.1) / 0.4);
-    const faceScore = clamp01(0.45 * smileScore + 0.35 * mouthScore + 0.2 * squintScore);
-
-    const faceIndicators =
-      (this.sSmile >= SMILE_ON ? 1 : 0) +
-      (this.sJaw >= JAW_ON ? 1 : 0) +
-      (this.sSquint >= SQUINT_ON ? 1 : 0);
-
-    const hasFace = face !== null;
-    const combinedScore = hasFace ? 0.55 * faceScore + 0.45 * audioScore : audioScore;
     const audioActive = energyRatio >= ENERGY_RATIO_TRIGGER;
+    const risingEdge = audioActive && !this.prevActive;
+    this.prevActive = audioActive;
 
-    // ---- state machine ----
-    if (this.state === 'COOLDOWN') {
-      if (now - this.candidateStart >= COOLDOWN_MS) this.state = 'QUIET';
-      return null;
+    // ---- Smile hysteresis (independent of the laugh machine) ----
+    let smileEvent: LaughEvent | null = null;
+    if (hasFace) {
+      if (!this.smiling) {
+        if (this.sSmile >= SMILE_ON) {
+          this.smiling = true;
+          this.neutralSince = 0;
+          smileEvent = this.makeEvent('smile', SMILE_POINTS, 0, this.sSmile);
+        }
+      } else {
+        // Currently smiling: only clear after a sustained drop to neutral.
+        if (this.sSmile < SMILE_OFF) {
+          if (!this.neutralSince) this.neutralSince = now;
+          else if (now - this.neutralSince >= SMILE_CLEAR_MS) {
+            this.smiling = false;
+            this.neutralSince = 0;
+          }
+        } else {
+          this.neutralSince = 0;
+        }
+      }
+    } else {
+      // Face gone: relax smile state (but don't count it as neutral cheating —
+      // face-absence is handled by the hook's timeout penalty).
+      this.smiling = false;
+      this.neutralSince = 0;
     }
 
+    const expression = this.expressionFor(hasFace, audioActive);
+
+    // A smile onset always reports (a laugh may also confirm below and add more).
+    // ---- Laugh state machine ----
+    const smileScore = clamp01((this.sSmile - 0.2) / 0.6);
+    const mouthScore = clamp01((this.sJaw - 0.12) / 0.5);
+    const squintScore = clamp01((this.sSquint - 0.1) / 0.4);
+    const faceScore = clamp01(0.5 * smileScore + 0.3 * mouthScore + 0.2 * squintScore);
+    const audioScore =
+      clamp01((energyRatio - 1) / (ENERGY_RATIO_TRIGGER * 2)) * 0.6 + clamp01(this.sHigh / 0.5) * 0.4;
+    const combinedScore = hasFace ? clamp01(0.7 * faceScore + 0.3 * audioScore) : 0;
+
+    const inCooldown = now < this.cooldownUntil;
+
     if (this.state === 'QUIET') {
-      // Start a candidate on audio energy plus (if a face is present) an actual
-      // smile forming — this is what keeps a silent smile from starting one.
-      const faceGate = hasFace ? this.sSmile >= 0.4 : audioScore > 0.35;
-      if (audioActive && faceGate) {
+      if (!inCooldown && hasFace && this.sSmile >= 0.3) {
         this.state = 'POSSIBLE';
         this.candidateStart = now;
         this.belowSince = 0;
         this.totalWindows = 1;
-        this.audioActiveWindows = 1;
+        this.faceWindows = 1;
         this.combinedSum = combinedScore;
-        this.audioSum = audioScore;
-        this.facePeakIndicators = faceIndicators;
-        this.faceSeen = hasFace;
+        this.bursts = audioActive ? 1 : 0;
+        this.smilePeak = this.sSmile;
+        this.jawPeak = this.sJaw;
+        this.squintPeak = this.sSquint;
       }
-      return null;
+      return { event: smileEvent, expression, smiling: this.smiling };
     }
 
     // POSSIBLE
     this.totalWindows += 1;
     this.combinedSum += combinedScore;
-    this.audioSum += audioScore;
-    if (hasFace) this.faceSeen = true;
-    if (faceIndicators > this.facePeakIndicators) this.facePeakIndicators = faceIndicators;
-    if (audioActive) {
-      this.audioActiveWindows += 1;
-      this.belowSince = 0;
-    } else if (!this.belowSince) {
-      this.belowSince = now;
-    }
+    if (hasFace) this.faceWindows += 1;
+    if (risingEdge) this.bursts += 1;
+    if (this.sSmile > this.smilePeak) this.smilePeak = this.sSmile;
+    if (this.sJaw > this.jawPeak) this.jawPeak = this.sJaw;
+    if (this.sSquint > this.squintPeak) this.squintPeak = this.sSquint;
+
+    const smilingWindow = this.sSmile >= SMILE_OFF;
+    if (smilingWindow) this.belowSince = 0;
+    else if (!this.belowSince) this.belowSince = now;
 
     const duration = now - this.candidateStart;
     const endedQuiet = this.belowSince > 0 && now - this.belowSince >= END_BELOW_MS;
-    const tooLong = duration > CANDIDATE_MAX_MS;
-    if (!endedQuiet && !tooLong) return null;
+    if (!endedQuiet && duration <= CANDIDATE_MAX_MS) {
+      return { event: smileEvent, expression, smiling: this.smiling };
+    }
 
-    // Candidate finished — decide, then cooldown regardless.
-    const activeRatio = this.audioActiveWindows / Math.max(1, this.totalWindows);
+    const facePresence = this.faceWindows / Math.max(1, this.totalWindows);
     const avgCombined = this.combinedSum / Math.max(1, this.totalWindows);
-    const avgAudio = this.audioSum / Math.max(1, this.totalWindows);
-    const durationOk = duration >= CANDIDATE_MIN_MS && duration <= CANDIDATE_MAX_MS;
+    const hasCue =
+      this.jawPeak >= JAW_CUE || this.squintPeak >= SQUINT_CUE || this.bursts >= BURST_CUE;
+    const confirmed =
+      duration >= CANDIDATE_MIN_MS &&
+      duration <= CANDIDATE_MAX_MS &&
+      facePresence >= MIN_FACE_PRESENCE &&
+      this.smilePeak >= SMILE_PEAK_MIN &&
+      hasCue &&
+      avgCombined >= CONFIRM_CONFIDENCE;
 
-    const confirmed = this.faceSeen
-      ? durationOk &&
-        activeRatio >= FUSED_ACTIVE_RATIO &&
-        this.facePeakIndicators >= FUSED_FACE_INDICATORS &&
-        avgCombined >= FUSED_CONFIDENCE
-      : durationOk && activeRatio >= AUDIO_ONLY_ACTIVE_RATIO && avgAudio >= AUDIO_ONLY_CONFIDENCE;
+    this.state = 'QUIET';
+    if (!confirmed) return { event: smileEvent, expression, smiling: this.smiling };
 
-    this.state = 'COOLDOWN';
-    this.candidateStart = now; // reuse as cooldown start
-
-    if (!confirmed) return null;
+    this.cooldownUntil = now + COOLDOWN_MS;
+    // A laugh outranks a coincident smile onset in the same tick.
     return {
-      clientEventId: crypto.randomUUID(),
-      occurredAt: Date.now(),
-      durationMs: Math.round(duration),
-      confidence: Math.round((this.faceSeen ? avgCombined : avgAudio) * 100) / 100,
-      detectorVersion: DETECTOR_VERSION,
+      event: this.makeEvent('laugh', LAUGH_POINTS, duration, avgCombined),
+      expression,
+      smiling: this.smiling,
     };
   }
 }
