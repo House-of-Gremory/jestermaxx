@@ -26,6 +26,15 @@ function reasonLabel(reason: ScoreReason, points: number): string {
 function fmtScore(n: number): string {
   return Number.isInteger(n) ? String(n) : n.toFixed(1);
 }
+
+// Each match lasts this long once both players are connected.
+const MATCH_DURATION_MS = 120_000;
+
+function fmtTime(seconds: number): string {
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return `${m}:${s.toString().padStart(2, '0')}`;
+}
 import IntroPlayback from './intro-playback';
 import { fetchIntro, loadCachedIntro, saveCachedIntro } from '../lib/intro-cache';
 import { loadSavedUsername, saveUsername } from '../lib/username';
@@ -124,6 +133,12 @@ export default function VideoCall() {
   const [oppFlash, setOppFlash] = useState(false);
   const [youToast, setYouToast] = useState<string | null>(null);
   const [oppToast, setOppToast] = useState<string | null>(null);
+  // Match timer + result. `matchResult` null = match in progress or not started.
+  const [timeLeft, setTimeLeft] = useState(MATCH_DURATION_MS / 1000);
+  const [matchResult, setMatchResult] = useState<'win' | 'lose' | null>(null);
+  // Latest scores, mirrored to a ref so the timer callback reads fresh values.
+  const scoresRef = useRef({ you: 0, opp: 0 });
+  const matchEndedRef = useRef(false);
 
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
@@ -171,6 +186,36 @@ export default function VideoCall() {
     const timer = setTimeout(() => setUsernameInput(saved), 0);
     return () => clearTimeout(timer);
   }, []);
+
+  // Keep a fresh copy of the scores for the timer callback to read.
+  useEffect(() => {
+    scoresRef.current = { you: youLaughed, opp: oppLaughed };
+  }, [youLaughed, oppLaughed]);
+
+  // 2-minute match timer. Starts when connected to an opponent. At zero: higher
+  // score wins (win/lose screen + call ends); a tie auto-finds the next player.
+  useEffect(() => {
+    if (!connected) return;
+    matchEndedRef.current = false;
+    const deadline = Date.now() + MATCH_DURATION_MS;
+    const id = setInterval(() => {
+      const remainMs = Math.max(0, deadline - Date.now());
+      setTimeLeft(Math.ceil(remainMs / 1000));
+      if (remainMs > 0 || matchEndedRef.current) return;
+      matchEndedRef.current = true;
+      const { you, opp } = scoresRef.current; // opp = your points, you = theirs
+      if (opp === you) {
+        // Tie -> automatically queue the next opponent (same as "Next player").
+        excludeRoomIdRef.current = roomIdRef.current;
+        setStatus('Draw — finding a new opponent…');
+        setSessionId((value) => value + 1);
+      } else {
+        setConnected(false); // freeze the match + stop detection
+        setMatchResult(opp > you ? 'win' : 'lose');
+      }
+    }, 250);
+    return () => clearInterval(id);
+  }, [connected]);
 
   useEffect(() => {
     if (!username) return;
@@ -323,6 +368,8 @@ export default function VideoCall() {
       setOppLaughed(0);
       setYouToast(null);
       setOppToast(null);
+      setMatchResult(null);
+      setTimeLeft(MATCH_DURATION_MS / 1000);
       setOpponentIntroRecord(null);
       setIntroHasPlayed(false);
       try {
@@ -488,8 +535,15 @@ export default function VideoCall() {
     excludeRoomIdRef.current = null;
     setStatus('');
     setUsername('');
+    setMatchResult(null);
     setOpponentIntroRecord(null);
     setIntroHasPlayed(false);
+  }
+
+  // From the result screen: clear it and immediately queue a fresh opponent.
+  function playAgain() {
+    setMatchResult(null);
+    nextPlayer();
   }
 
   return (
@@ -546,6 +600,15 @@ export default function VideoCall() {
                 className={`h-2.5 w-2.5 rounded-full ${connected ? 'bg-lime-400' : 'animate-pulse bg-amber-400'}`}
               />
               {status}
+              {connected && (
+                <span
+                  className={`ml-2 rounded-md bg-white/10 px-2 py-0.5 font-black tabular-nums ${
+                    timeLeft <= 10 ? 'text-red-400' : 'text-lime-400'
+                  }`}
+                >
+                  ⏱ {fmtTime(timeLeft)}
+                </span>
+              )}
             </p>
 
             {/* Scoreboard: you score by making the opponent laugh; if YOU laugh,
@@ -631,6 +694,42 @@ export default function VideoCall() {
           </section>
         )}
       </div>
+
+      {matchResult && (
+        <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-8 bg-[#07060a]/95 px-6 text-center backdrop-blur">
+          <div>
+            <div
+              className="text-6xl font-black uppercase tracking-tight sm:text-8xl"
+              style={{
+                color: matchResult === 'win' ? '#a3e635' : '#f87171',
+                textShadow:
+                  matchResult === 'win'
+                    ? '0 0 30px rgba(163,230,53,0.6)'
+                    : '0 0 30px rgba(248,113,113,0.5)',
+              }}
+            >
+              {matchResult === 'win' ? 'You Win' : 'You Lose'}
+            </div>
+            <p className="mt-4 text-sm uppercase tracking-[0.3em] text-white/60">
+              You {fmtScore(oppLaughed)} · Them {fmtScore(youLaughed)}
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center justify-center gap-3">
+            <button
+              onClick={playAgain}
+              className="rounded-xl bg-lime-400 px-8 py-3.5 text-sm font-black uppercase tracking-widest text-black transition hover:bg-lime-300"
+            >
+              Play again
+            </button>
+            <button
+              onClick={endCall}
+              className="rounded-xl border border-white/20 bg-white/5 px-8 py-3.5 text-sm font-bold uppercase tracking-widest text-white/80 transition hover:border-white/40 hover:text-white"
+            >
+              Back to menu
+            </button>
+          </div>
+        </div>
+      )}
     </main>
   );
 }
