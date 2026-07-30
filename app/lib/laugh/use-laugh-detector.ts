@@ -3,20 +3,33 @@
 import { type RefObject, useEffect, useRef, useState } from 'react';
 import { AudioAnalyzer } from './audio-analyzer';
 import { FaceDetector } from './face-detector';
+import { HandDetector } from './hand-detector';
 import { LaughDetector } from './laugh-detector';
 import type {
   ExpressionLabel,
   FaceBox,
   FaceSample,
+  HandPoint,
   LaughDetectorStatus,
   LaughEvent,
 } from './types';
 
 const AUDIO_FRAME_MS = 33; // ~30 Hz audio analysis
 const FACE_FRAME_MS = 120; // ~8 Hz face inference (heavier; light + spec §16)
+const HAND_FRAME_MS = 160; // ~6 Hz hand inference (only for mouth-cover check)
 const EXPRESSION_THROTTLE_MS = 200; // limit expression re-renders to ~5 Hz
 const FACE_TIMEOUT_MS = 12_000; // no face this long -> fairness penalty
 const PENALTY_POINTS = 3; // points to the opponent when you hide your face
+
+// Anti-cheat: a hand held over the mouth to muffle laughs. Set to false to skip
+// loading the hand model entirely (lighter) if you don't want this check.
+const DETECT_MOUTH_COVER = true;
+const MOUTH_COVER_MS = 4000; // hand over mouth this long -> penalty
+const MOUTH_COVER_POINTS = 2;
+
+function pointInBox(p: HandPoint, box: FaceBox): boolean {
+  return p.x >= box.x && p.x <= box.x + box.w && p.y >= box.y && p.y <= box.y + box.h;
+}
 
 // Drives the fused laugh detector off the existing local media. Audio runs every
 // frame; face inference runs at a lower rate and its latest sample is reused by
@@ -66,19 +79,24 @@ export function useLaughDetector({
     }
 
     const activeStream = stream as MediaStream;
+    const hasVideo = activeStream.getVideoTracks().length > 0;
     const overlayCanvas = overlayRef.current; // captured for cleanup
     const detector = new LaughDetector();
     const faceDetector = new FaceDetector();
+    const handDetector = new HandDetector();
     let analyzer: AudioAnalyzer | null = null;
 
     let rafId = 0;
     let lastAudio = 0;
     let lastFace = 0;
+    let lastHand = 0;
     let announced = false;
     let latestFace: FaceSample | null = null;
     let faceFlag = false;
     let lastFaceSeenAt = 0; // 0 until the model is ready and monitoring starts
     let penalized = false;
+    let coverSince = 0;
+    let mouthPenalized = false;
     let lastExprAt = 0;
     let lastExpr: ExpressionLabel | null = null;
     let flashTimer: ReturnType<typeof setTimeout> | null = null;
@@ -158,6 +176,35 @@ export function useLaughDetector({
         }
       }
 
+      // Hand inference (low rate) — only to catch a hand held over the mouth to
+      // muffle laughs. Uses the mouth box from the latest face sample.
+      if (DETECT_MOUTH_COVER && handDetector.ready && t - lastHand >= HAND_FRAME_MS && videoRef.current) {
+        lastHand = t;
+        const hands = handDetector.detect(videoRef.current, t);
+        const mouthBox = latestFace?.faceAvailable ? latestFace.mouthBox : undefined;
+        if (hands && mouthBox) {
+          const covered = hands.some((hand) => hand.some((p) => pointInBox(p, mouthBox)));
+          if (covered) {
+            if (!coverSince) coverSince = t;
+            else if (!mouthPenalized && t - coverSince >= MOUTH_COVER_MS) {
+              mouthPenalized = true;
+              onLaughRef.current?.({
+                clientEventId: crypto.randomUUID(),
+                occurredAt: Date.now(),
+                durationMs: MOUTH_COVER_MS,
+                confidence: 1,
+                detectorVersion: 'mouth-cover',
+                reason: 'mouth-cover',
+                points: MOUTH_COVER_POINTS,
+              });
+            }
+          } else {
+            coverSince = 0;
+            mouthPenalized = false;
+          }
+        }
+      }
+
       // Audio analysis every frame drives the detector, fusing the latest face.
       if (analyzer && t - lastAudio >= AUDIO_FRAME_MS) {
         lastAudio = t;
@@ -193,10 +240,15 @@ export function useLaughDetector({
         }
         rafId = requestAnimationFrame(loop);
         // Face model loads in the background; audio-only until it is ready.
-        if (activeStream.getVideoTracks().length > 0) {
+        if (hasVideo) {
           faceDetector.init().catch((error) => {
             console.warn('Face detector unavailable, using audio only', error);
           });
+          if (DETECT_MOUTH_COVER) {
+            handDetector.init().catch((error) => {
+              console.warn('Hand detector unavailable, mouth-cover check off', error);
+            });
+          }
         }
       } catch (error) {
         console.error('Laugh detector failed to start', error);
@@ -210,6 +262,7 @@ export function useLaughDetector({
       if (flashTimer) clearTimeout(flashTimer);
       analyzer?.close();
       faceDetector.close();
+      handDetector.close();
       const ctx = overlayCanvas?.getContext('2d');
       if (overlayCanvas && ctx) ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
       setRecentLaugh(false);

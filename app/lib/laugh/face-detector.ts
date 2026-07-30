@@ -31,6 +31,9 @@ function silenceMediapipeInfoLogs() {
   console.info = patch(console.info.bind(console));
 }
 
+// MediaPipe 468-mesh indices around the lips (corners + inner/outer top/bottom).
+const MOUTH_LANDMARKS = [61, 291, 0, 17, 13, 14, 78, 308, 40, 270];
+
 export class FaceDetector {
   private landmarker: FaceLandmarker | null = null;
   private lastVideoTime = -1;
@@ -84,10 +87,33 @@ export class FaceDetector {
       if (p.y > maxY) maxY = p.y;
     }
 
+    // Tight box around the mouth (lip corners + top/bottom lip landmarks), padded
+    // a little, so a hand-over-mouth check has a region to test against.
+    let mMinX = 1;
+    let mMinY = 1;
+    let mMaxX = 0;
+    let mMaxY = 0;
+    for (const i of MOUTH_LANDMARKS) {
+      const p = landmarks[i];
+      if (!p) continue;
+      if (p.x < mMinX) mMinX = p.x;
+      if (p.y < mMinY) mMinY = p.y;
+      if (p.x > mMaxX) mMaxX = p.x;
+      if (p.y > mMaxY) mMaxY = p.y;
+    }
+    const padX = (mMaxX - mMinX) * 0.4;
+    const padY = (mMaxY - mMinY) * 0.6;
+
     return {
       faceAvailable: true,
       features,
       box: { x: minX, y: minY, w: maxX - minX, h: maxY - minY },
+      mouthBox: {
+        x: mMinX - padX,
+        y: mMinY - padY,
+        w: mMaxX - mMinX + padX * 2,
+        h: mMaxY - mMinY + padY * 2,
+      },
     };
   }
 

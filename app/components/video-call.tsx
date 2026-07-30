@@ -16,9 +16,15 @@ const EXPRESSION_BADGE: Record<ExpressionLabel, string> = {
 
 // Short toast text for a scoring event, shown briefly beside the counter.
 function reasonLabel(reason: ScoreReason, points: number): string {
-  if (reason === 'smile') return `🙂 smile bonus +${points}`;
+  if (reason === 'smile') return `🙂 smile +${points}`;
   if (reason === 'face-timeout') return `🙈 no-show +${points}`;
+  if (reason === 'mouth-cover') return `✋ mouth cover +${points}`;
   return `😂 +${points}`;
+}
+
+// Scores can be fractional (a smile is 0.5). Show whole numbers cleanly.
+function fmtScore(n: number): string {
+  return Number.isInteger(n) ? String(n) : n.toFixed(1);
 }
 import IntroPlayback from './intro-playback';
 import { fetchIntro, loadCachedIntro, saveCachedIntro } from '../lib/intro-cache';
@@ -551,7 +557,7 @@ export default function VideoCall() {
                     {oppToast}
                   </span>
                 )}
-                <div className="text-2xl font-black text-lime-400">{oppLaughed}</div>
+                <div className="text-2xl font-black text-lime-400">{fmtScore(oppLaughed)}</div>
                 <div className="text-[10px] font-bold uppercase tracking-widest text-white/50">
                   Your points · they cracked
                 </div>
@@ -562,7 +568,7 @@ export default function VideoCall() {
                     {youToast}
                   </span>
                 )}
-                <div className="text-2xl font-black text-red-400">{youLaughed}</div>
+                <div className="text-2xl font-black text-red-400">{fmtScore(youLaughed)}</div>
                 <div className="text-[10px] font-bold uppercase tracking-widest text-white/50">
                   You cracked · point to them
                 </div>
