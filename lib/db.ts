@@ -35,10 +35,28 @@ export type IntroRecord = {
   createdAt: number;
 };
 
+export type TurnServerStatus = 'unknown' | 'up' | 'down';
+
+export type TurnServerRecord = {
+  id: string;
+  label: string;
+  // One or more RTCIceServer-style URLs sharing the same credential, e.g.
+  // ["turn:relay.example.com:3478?transport=udp", "turns:relay.example.com:5349"].
+  urls: string[];
+  username: string;
+  credential: string;
+  createdAt: number;
+  status: TurnServerStatus;
+  latencyMs: number | null;
+  lastCheckedAt: number | null;
+  lastError: string | null;
+};
+
 export type Database = {
   rooms: RoomRecord[];
   participants: ParticipantRecord[];
   intros: IntroRecord[];
+  turnServers: TurnServerRecord[];
 };
 
 const redis =
@@ -51,7 +69,22 @@ const REDIS_LOCK_KEY = 'jestermaxing:signaling:lock';
 // Local development fallback. Vercel instances do not share process memory,
 // so production requires the shared Redis store configured above.
 const globalStore = globalThis as unknown as { __jesterDb?: Database };
-const localStore: Database = (globalStore.__jesterDb ??= { rooms: [], participants: [], intros: [] });
+const localStore: Database = (globalStore.__jesterDb ??= {
+  rooms: [],
+  participants: [],
+  intros: [],
+  turnServers: [],
+});
+
+// A single-attempt, non-retrying lock (unlike the read-modify-write lock
+// below, which retries). Used to let multiple server instances race to claim
+// a piece of periodic work — e.g. one wall-clock time bucket — without
+// duplicating it. Returns true if this call won the lock.
+export async function tryAcquireLock(key: string, ttlSeconds: number): Promise<boolean> {
+  if (!redis) return true;
+  const acquired = await redis.set(key, '1', { nx: true, ex: ttlSeconds });
+  return acquired === 'OK';
+}
 
 async function acquireLock() {
   if (!redis) return null;
@@ -90,6 +123,7 @@ export async function withDatabase<T>(
     // Guards against a dev-server hot reload keeping an older globalThis
     // object around from before a field (e.g. `intros`) was added here.
     localStore.intros ??= [];
+    localStore.turnServers ??= [];
     return operation({ data: localStore });
   }
 
@@ -99,8 +133,10 @@ export async function withDatabase<T>(
       rooms: [],
       participants: [],
       intros: [],
+      turnServers: [],
     };
     data.intros ??= [];
+    data.turnServers ??= [];
     const result = await operation({ data });
     await redis.set(REDIS_DATA_KEY, data, { ex: 60 * 60 });
     return result;
