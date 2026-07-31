@@ -2,6 +2,7 @@
 
 import { useEffect, useState, type FormEvent } from 'react';
 import { useRouter } from 'next/navigation';
+import Link from 'next/link';
 import type { TurnServerRecord } from '@/lib/db';
 
 const STATUS_STYLES: Record<TurnServerRecord['status'], string> = {
@@ -116,12 +117,20 @@ export default function AdminTurnServersPage() {
       <div className="mx-auto max-w-4xl">
         <div className="mb-8 flex items-center justify-between">
           <h1 className="text-lg font-bold uppercase tracking-[0.3em] text-lime-400">TURN Servers</h1>
-          <button
-            onClick={handleLogout}
-            className="rounded-full border border-white/20 px-4 py-1.5 text-xs uppercase tracking-widest text-white/70 transition hover:border-fuchsia-400 hover:text-fuchsia-300"
-          >
-            Log out
-          </button>
+          <div className="flex items-center gap-3">
+            <Link
+              href="/admin/network-check"
+              className="rounded-full border border-white/20 px-4 py-1.5 text-xs uppercase tracking-widest text-white/70 transition hover:border-lime-400 hover:text-lime-300"
+            >
+              Network check
+            </Link>
+            <button
+              onClick={handleLogout}
+              className="rounded-full border border-white/20 px-4 py-1.5 text-xs uppercase tracking-widest text-white/70 transition hover:border-fuchsia-400 hover:text-fuchsia-300"
+            >
+              Log out
+            </button>
+          </div>
         </div>
 
         {error && (

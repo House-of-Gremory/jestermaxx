@@ -45,7 +45,8 @@ type SignalMessage =
   | { type: 'bye' }
   | { type: 'offer' | 'answer'; payload: RTCSessionDescriptionInit }
   | { type: 'candidate'; payload: RTCIceCandidateInit }
-  | { type: 'laugh'; payload: LaughEvent };
+  | { type: 'laugh'; payload: LaughEvent }
+  | { type: 'relay-upgrade' };
 
 const FALLBACK_ICE_SERVERS: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }];
 
@@ -53,6 +54,19 @@ const FALLBACK_ICE_SERVERS: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19
 // (and faster ghost cleanup, since each poll refreshes lastSeen) at the cost of
 // more requests. 400ms keeps connection setup snappy without hammering.
 const POLL_INTERVAL_MS = 400;
+
+// First attempt connects with STUN only (no TURN in the config at all), so no
+// relay allocation happens unless it's actually needed — host candidates
+// still cover both IPv4 and IPv6 automatically (the browser gathers every
+// address family the OS routes to; nothing extra is needed for that). If ICE
+// hasn't connected by this deadline, both sides add the TURN pool and the
+// caller drives an ICE restart. DCUtR-style: direct first, relay as fallback.
+const DIRECT_ATTEMPT_TIMEOUT_MS = 4000;
+
+function isStunOnly(entry: RTCIceServer): boolean {
+  const urls = Array.isArray(entry.urls) ? entry.urls : [entry.urls];
+  return urls.every((url) => url.startsWith('stun:') || url.startsWith('stuns:'));
+}
 
 async function fetchIceServers(): Promise<RTCIceServer[]> {
   try {
@@ -150,6 +164,14 @@ export default function VideoCall() {
   const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const stoppedRef = useRef(false);
   const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
+  // Full ICE server pool (incl. TURN), fetched once per call; held back from
+  // the initial RTCPeerConnection config until/unless the relay fallback fires.
+  const fullIceServersRef = useRef<RTCIceServer[]>([]);
+  // Only the offerer drives an ICE restart — the callee just upgrades its own
+  // config in response to the 'relay-upgrade' signal.
+  const isCallerRef = useRef(false);
+  const relayFallbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const relayAppliedRef = useRef(false);
   // The room a "Next player" click is leaving, so the server won't rematch it.
   const excludeRoomIdRef = useRef<string | null>(null);
   // Bridges the laugh detector (component scope) to sendSignal (effect scope).
@@ -222,6 +244,12 @@ export default function VideoCall() {
 
     stoppedRef.current = false;
     pendingCandidatesRef.current = [];
+    isCallerRef.current = false;
+    relayAppliedRef.current = false;
+    if (relayFallbackTimerRef.current) {
+      clearTimeout(relayFallbackTimerRef.current);
+      relayFallbackTimerRef.current = null;
+    }
     if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
 
     async function sendSignal(message: SignalMessage) {
@@ -265,9 +293,49 @@ export default function VideoCall() {
       const peerConnection = peerConnectionRef.current;
       if (!peerConnection) return;
 
+      isCallerRef.current = true;
       const offer = await peerConnection.createOffer();
       await peerConnection.setLocalDescription(offer);
+      scheduleRelayFallback();
       await sendSignal({ type: 'offer', payload: offer });
+    }
+
+    // Upgrades this peer's own config to include TURN, and — only if we're the
+    // one who made the original offer — drives an ICE restart so both sides
+    // renegotiate with relay candidates in play. The 'relay-upgrade' signal is
+    // sent (and awaited) before the restart offer, and the signaling queue is
+    // FIFO per participant, so the callee always applies the same config
+    // upgrade before it ever sees the restart offer — no race between the two.
+    async function applyRelayFallback() {
+      const peerConnection = peerConnectionRef.current;
+      if (!peerConnection || relayAppliedRef.current) return;
+      relayAppliedRef.current = true;
+      if (relayFallbackTimerRef.current) {
+        clearTimeout(relayFallbackTimerRef.current);
+        relayFallbackTimerRef.current = null;
+      }
+
+      setStatus('Direct connection is slow — falling back to relay…');
+      peerConnection.setConfiguration({ iceServers: fullIceServersRef.current });
+
+      if (isCallerRef.current) {
+        await sendSignal({ type: 'relay-upgrade' });
+        const offer = await peerConnection.createOffer({ iceRestart: true });
+        await peerConnection.setLocalDescription(offer);
+        await sendSignal({ type: 'offer', payload: offer });
+      }
+    }
+
+    function scheduleRelayFallback() {
+      if (relayFallbackTimerRef.current || relayAppliedRef.current) return;
+      relayFallbackTimerRef.current = setTimeout(() => {
+        relayFallbackTimerRef.current = null;
+        const peerConnection = peerConnectionRef.current;
+        if (!peerConnection || relayAppliedRef.current) return;
+        const state = peerConnection.iceConnectionState;
+        if (state === 'connected' || state === 'completed') return; // direct path worked
+        void applyRelayFallback();
+      }, DIRECT_ATTEMPT_TIMEOUT_MS);
     }
 
     async function flushPendingCandidates() {
@@ -299,6 +367,7 @@ export default function VideoCall() {
         await flushPendingCandidates();
         const answer = await peerConnection.createAnswer();
         await peerConnection.setLocalDescription(answer);
+        scheduleRelayFallback();
         await sendSignal({ type: 'answer', payload: answer });
       } else if (message.type === 'answer') {
         await peerConnection.setRemoteDescription(message.payload);
@@ -310,6 +379,18 @@ export default function VideoCall() {
           await peerConnection.addIceCandidate(message.payload);
         } else {
           pendingCandidatesRef.current.push(message.payload);
+        }
+      } else if (message.type === 'relay-upgrade') {
+        // The caller decided direct isn't working — upgrade our own config
+        // now, ahead of the restart offer that's guaranteed to follow it.
+        if (!relayAppliedRef.current) {
+          relayAppliedRef.current = true;
+          if (relayFallbackTimerRef.current) {
+            clearTimeout(relayFallbackTimerRef.current);
+            relayFallbackTimerRef.current = null;
+          }
+          setStatus('Direct connection is slow — falling back to relay…');
+          peerConnection.setConfiguration({ iceServers: fullIceServersRef.current });
         }
       } else if (message.type === 'bye') {
         // Opponent left the call. Clear their video/intro and prompt for a new one.
@@ -411,7 +492,13 @@ export default function VideoCall() {
         if (stream && localVideoRef.current) localVideoRef.current.srcObject = stream;
 
         const iceServers = await fetchIceServers();
-        const peerConnection = new RTCPeerConnection({ iceServers });
+        fullIceServersRef.current = iceServers;
+        // Direct-first: gather with STUN only (IPv4 and IPv6 host/srflx
+        // candidates both come along automatically, no TURN allocated yet).
+        const directOnlyServers = iceServers.filter(isStunOnly);
+        const peerConnection = new RTCPeerConnection({
+          iceServers: directOnlyServers.length ? directOnlyServers : iceServers,
+        });
         peerConnectionRef.current = peerConnection;
 
         const haveVideo = (stream?.getVideoTracks().length ?? 0) > 0;
@@ -458,10 +545,12 @@ export default function VideoCall() {
             setConnected(true);
             setStatus('Connected.');
           } else if (state === 'failed') {
-            setConnected(false);
-            setStatus(
-              'Connection failed — no network path to the opponent (needs a TURN server across different networks).',
-            );
+            if (!relayAppliedRef.current) {
+              void applyRelayFallback();
+            } else {
+              setConnected(false);
+              setStatus('Connection failed — even the relay could not reach the opponent.');
+            }
           } else if (state === 'disconnected') {
             setStatus('Connection lost, retrying…');
           }
@@ -486,6 +575,7 @@ export default function VideoCall() {
       stoppedRef.current = true;
       window.removeEventListener('pagehide', sendByeBeacon);
       if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
+      if (relayFallbackTimerRef.current) clearTimeout(relayFallbackTimerRef.current);
       void sendSignal({ type: 'bye' });
       peerConnectionRef.current?.close();
       peerConnectionRef.current = null;
