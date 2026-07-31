@@ -46,7 +46,16 @@ type SignalMessage =
   | { type: 'offer' | 'answer'; payload: RTCSessionDescriptionInit }
   | { type: 'candidate'; payload: RTCIceCandidateInit }
   | { type: 'laugh'; payload: LaughEvent }
+  // Periodic authoritative total of the points this peer has conceded (i.e. how
+  // much they laughed). Individual 'laugh' messages give instant feedback, but
+  // they are one-shot: the server splices each message off the queue and never
+  // redelivers it, so a single dropped POST/poll would desync the scores for the
+  // rest of the match. This resync makes that self-healing.
+  | { type: 'score-sync'; payload: { conceded: number } }
   | { type: 'relay-upgrade' };
+
+// How often each peer rebroadcasts its authoritative conceded-point total.
+const SCORE_SYNC_INTERVAL_MS = 2000;
 
 const FALLBACK_ICE_SERVERS: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }];
 
@@ -281,6 +290,14 @@ export default function VideoCall() {
     // Expose a laugh sender to the detector callback living in component scope.
     sendLaughRef.current = (event: LaughEvent) => void sendSignal({ type: 'laugh', payload: event });
 
+    // Each peer is authoritative for how much IT laughed, and rebroadcasts that
+    // running total. If a one-shot 'laugh' message is ever dropped, the next
+    // sync repairs the opponent's scoreboard instead of leaving it desynced for
+    // the rest of the match (which previously made both players lose).
+    const scoreSyncTimer = setInterval(() => {
+      void sendSignal({ type: 'score-sync', payload: { conceded: scoresRef.current.you } });
+    }, SCORE_SYNC_INTERVAL_MS);
+
     // Looks up the opponent's saved intro reel (cache first) as soon as we
     // know who they are, so their reel — not our own — plays while we wait.
     async function loadOpponentIntro(opponentUsername: string) {
@@ -353,6 +370,45 @@ export default function VideoCall() {
     }
 
     async function handleSignal(message: SignalMessage) {
+      // Scoring and lifecycle messages must be handled BEFORE the peer-connection
+      // guard below: they don't need one, and dropping them would lose points
+      // permanently (the server never redelivers a message once polled).
+      if (message.type === 'laugh') {
+        // Instant feedback for a single scoring event. The authoritative total
+        // still arrives via 'score-sync', so a lost message can't desync us.
+        const scored = message.payload;
+        const points = Number(scored?.points);
+        if (Number.isFinite(points) && points > 0) {
+          setOppLaughed((value) => Math.max(value, value + points));
+          setOppToast(reasonLabel(scored.reason, points));
+          if (oppToastTimerRef.current) clearTimeout(oppToastTimerRef.current);
+          oppToastTimerRef.current = setTimeout(() => setOppToast(null), 1600);
+        }
+        setOppFlash(true);
+        if (oppFlashTimerRef.current) clearTimeout(oppFlashTimerRef.current);
+        oppFlashTimerRef.current = setTimeout(() => setOppFlash(false), 1200);
+        return;
+      }
+
+      if (message.type === 'score-sync') {
+        // The opponent is authoritative for how much they laughed. Taking the
+        // max keeps this monotonic and idempotent, so repeated or out-of-order
+        // syncs can never lower or double-count a score.
+        const conceded = Number(message.payload?.conceded);
+        if (Number.isFinite(conceded)) setOppLaughed((value) => Math.max(value, conceded));
+        return;
+      }
+
+      if (message.type === 'bye') {
+        // Opponent left the call. Clear their video/intro and prompt for a new one.
+        setConnected(false);
+        setOpponentIntroRecord(null);
+        setIntroHasPlayed(false);
+        if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
+        setStatus('Opponent left. Tap “Next player” to find someone new.');
+        return;
+      }
+
       const peerConnection = peerConnectionRef.current;
       if (!peerConnection) return;
 
@@ -392,23 +448,6 @@ export default function VideoCall() {
           setStatus('Direct connection is slow — falling back to relay…');
           peerConnection.setConfiguration({ iceServers: fullIceServersRef.current });
         }
-      } else if (message.type === 'bye') {
-        // Opponent left the call. Clear their video/intro and prompt for a new one.
-        setConnected(false);
-        setOpponentIntroRecord(null);
-        setIntroHasPlayed(false);
-        if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
-        setStatus('Opponent left. Tap “Next player” to find someone new.');
-      } else if (message.type === 'laugh') {
-        // The opponent's browser scored an event -> you gain the points.
-        const scored = message.payload;
-        setOppLaughed((value) => value + scored.points);
-        setOppToast(reasonLabel(scored.reason, scored.points));
-        if (oppToastTimerRef.current) clearTimeout(oppToastTimerRef.current);
-        oppToastTimerRef.current = setTimeout(() => setOppToast(null), 1600);
-        setOppFlash(true);
-        if (oppFlashTimerRef.current) clearTimeout(oppFlashTimerRef.current);
-        oppFlashTimerRef.current = setTimeout(() => setOppFlash(false), 1200);
       }
     }
 
@@ -582,6 +621,7 @@ export default function VideoCall() {
       localStreamRef.current?.getTracks().forEach((track) => track.stop());
       localStreamRef.current = null;
       sendLaughRef.current = null;
+      clearInterval(scoreSyncTimer);
       if (oppFlashTimerRef.current) clearTimeout(oppFlashTimerRef.current);
       if (youToastTimerRef.current) clearTimeout(youToastTimerRef.current);
       if (oppToastTimerRef.current) clearTimeout(oppToastTimerRef.current);
