@@ -1,5 +1,5 @@
 import { tryAcquireLock } from '@/lib/db';
-import { checkAllTurnServers } from '@/lib/turn-check';
+import { checkAllTurnServers, refreshAllTurnProviders } from '@/lib/turn-check';
 
 const CHECK_INTERVAL_MS = 5 * 60 * 1000;
 const LOCK_TTL_SECONDS = 280; // just under 5 min, so a slow instance can't hold it into the next bucket
@@ -13,7 +13,7 @@ async function runCheckCycle() {
     const acquired = await tryAcquireLock(`jestermaxing:turn-check:lock:${bucket}`, LOCK_TTL_SECONDS);
     if (!acquired) return;
 
-    await checkAllTurnServers();
+    await Promise.all([checkAllTurnServers(), refreshAllTurnProviders()]);
   } catch (error) {
     console.error('TURN server health check failed:', error);
   }

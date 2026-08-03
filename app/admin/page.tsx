@@ -3,7 +3,8 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
-import type { TurnServerRecord } from '@/lib/db';
+import type { TurnServerRecord, TurnProviderRecord } from '@/lib/db';
+import { TURN_PROVIDER_TYPES, type TurnProviderType } from '@/lib/turn-provider-types';
 
 const STATUS_STYLES: Record<TurnServerRecord['status'], string> = {
   up: 'bg-lime-400/15 text-lime-300 border-lime-400/30',
@@ -14,6 +15,14 @@ const STATUS_STYLES: Record<TurnServerRecord['status'], string> = {
 function formatLastChecked(ts: number | null) {
   if (!ts) return 'never';
   return new Date(ts).toLocaleTimeString();
+}
+
+function formatExpiry(ts: number | null) {
+  if (!ts) return 'no known expiry';
+  const minutesLeft = Math.round((ts - Date.now()) / 60_000);
+  if (minutesLeft <= 0) return 'expired';
+  if (minutesLeft < 60) return `in ${minutesLeft}m`;
+  return `in ${Math.round(minutesLeft / 60)}h`;
 }
 
 export default function AdminTurnServersPage() {
@@ -28,6 +37,12 @@ export default function AdminTurnServersPage() {
   const [username, setUsername] = useState('');
   const [credential, setCredential] = useState('');
 
+  const [providers, setProviders] = useState<TurnProviderRecord[] | null>(null);
+  const [providerLabel, setProviderLabel] = useState('');
+  const [providerType, setProviderType] = useState<TurnProviderType>('xirsys');
+  const [providerConfig, setProviderConfig] = useState<Record<string, string>>({});
+  const [providerSubmitting, setProviderSubmitting] = useState(false);
+
   async function loadServers() {
     const response = await fetch('/api/admin/turn-servers');
     if (!response.ok) {
@@ -38,18 +53,35 @@ export default function AdminTurnServersPage() {
     setServers(data.servers);
   }
 
+  async function loadProviders() {
+    const response = await fetch('/api/admin/turn-providers');
+    if (!response.ok) {
+      setError('Failed to load TURN providers');
+      return;
+    }
+    const data = (await response.json()) as { providers: TurnProviderRecord[] };
+    setProviders(data.providers);
+  }
+
   useEffect(() => {
     let cancelled = false;
-    fetch('/api/admin/turn-servers')
-      .then((response) => {
+    Promise.all([
+      fetch('/api/admin/turn-servers').then((response) => {
         if (!response.ok) throw new Error('Failed to load TURN servers');
         return response.json() as Promise<{ servers: TurnServerRecord[] }>;
-      })
-      .then((data) => {
-        if (!cancelled) setServers(data.servers);
+      }),
+      fetch('/api/admin/turn-providers').then((response) => {
+        if (!response.ok) throw new Error('Failed to load TURN providers');
+        return response.json() as Promise<{ providers: TurnProviderRecord[] }>;
+      }),
+    ])
+      .then(([serversData, providersData]) => {
+        if (cancelled) return;
+        setServers(serversData.servers);
+        setProviders(providersData.providers);
       })
       .catch(() => {
-        if (!cancelled) setError('Failed to load TURN servers');
+        if (!cancelled) setError('Failed to load TURN pool');
       });
     return () => {
       cancelled = true;
@@ -91,16 +123,52 @@ export default function AdminTurnServersPage() {
     await loadServers();
   }
 
+  async function handleAddProvider(event: FormEvent) {
+    event.preventDefault();
+    setProviderSubmitting(true);
+    setError('');
+    try {
+      const response = await fetch('/api/admin/turn-providers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ label: providerLabel, type: providerType, config: providerConfig }),
+      });
+      const data = (await response.json().catch(() => null)) as { error?: string } | null;
+      if (!response.ok) {
+        setError(data?.error ?? 'Failed to add TURN provider');
+        return;
+      }
+      setProviderLabel('');
+      setProviderConfig({});
+      await loadProviders();
+    } finally {
+      setProviderSubmitting(false);
+    }
+  }
+
+  async function handleDeleteProvider(id: string) {
+    setError('');
+    const response = await fetch(`/api/admin/turn-providers/${id}`, { method: 'DELETE' });
+    if (!response.ok) {
+      setError('Failed to delete TURN provider');
+      return;
+    }
+    await loadProviders();
+  }
+
   async function handleCheckNow() {
     setChecking(true);
     setError('');
     try {
-      const response = await fetch('/api/admin/turn-servers/check-now', { method: 'POST' });
-      if (!response.ok) {
+      const [serversResponse, providersResponse] = await Promise.all([
+        fetch('/api/admin/turn-servers/check-now', { method: 'POST' }),
+        fetch('/api/admin/turn-providers/check-now', { method: 'POST' }),
+      ]);
+      if (!serversResponse.ok || !providersResponse.ok) {
         setError('Health check failed to run');
         return;
       }
-      await loadServers();
+      await Promise.all([loadServers(), loadProviders()]);
     } finally {
       setChecking(false);
     }
@@ -137,6 +205,7 @@ export default function AdminTurnServersPage() {
           <p className="mb-6 rounded-lg bg-red-500/10 px-3 py-2 text-sm text-red-300">{error}</p>
         )}
 
+        <h2 className="mb-3 text-sm uppercase tracking-widest text-white/50">Static relay (manual credentials)</h2>
         <form
           onSubmit={handleAdd}
           className="mb-10 grid gap-4 rounded-2xl border border-white/10 bg-white/5 p-6 sm:grid-cols-2"
@@ -195,7 +264,7 @@ export default function AdminTurnServersPage() {
 
         <div className="mb-4 flex items-center justify-between">
           <h2 className="text-sm uppercase tracking-widest text-white/50">
-            Pool ({servers?.length ?? 0}) — best to worst
+            Static pool ({servers?.length ?? 0})
           </h2>
           <button
             onClick={handleCheckNow}
@@ -260,6 +329,138 @@ export default function AdminTurnServersPage() {
                   <td className="px-4 py-3">
                     <button
                       onClick={() => handleDelete(server.id)}
+                      className="text-xs uppercase tracking-widest text-red-300/70 hover:text-red-300"
+                    >
+                      Delete
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        <h2 className="mb-3 mt-12 text-sm uppercase tracking-widest text-white/50">
+          Providers (broker credentials, auto-refreshed)
+        </h2>
+        <form
+          onSubmit={handleAddProvider}
+          className="mb-10 grid gap-4 rounded-2xl border border-white/10 bg-white/5 p-6 sm:grid-cols-2"
+        >
+          <label className="block text-xs uppercase tracking-widest text-white/50 sm:col-span-2">
+            Label (optional)
+            <input
+              className="mt-1 w-full rounded-lg border border-white/10 bg-black/40 px-3 py-2 text-sm text-white outline-none focus:border-lime-400"
+              value={providerLabel}
+              onChange={(event) => setProviderLabel(event.target.value)}
+              placeholder="e.g. xirsys-main"
+            />
+          </label>
+
+          <label className="block text-xs uppercase tracking-widest text-white/50 sm:col-span-2">
+            Provider
+            <select
+              className="mt-1 w-full rounded-lg border border-white/10 bg-black/40 px-3 py-2 text-sm text-white outline-none focus:border-lime-400"
+              value={providerType}
+              onChange={(event) => {
+                setProviderType(event.target.value as TurnProviderType);
+                setProviderConfig({});
+              }}
+            >
+              {Object.entries(TURN_PROVIDER_TYPES).map(([key, meta]) => (
+                <option key={key} value={key}>
+                  {meta.label}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          {TURN_PROVIDER_TYPES[providerType].fields.map((field) => (
+            <label key={field.key} className="block text-xs uppercase tracking-widest text-white/50">
+              {field.label}
+              <input
+                type={field.secret ? 'password' : 'text'}
+                className="mt-1 w-full rounded-lg border border-white/10 bg-black/40 px-3 py-2 text-sm text-white outline-none focus:border-lime-400"
+                value={providerConfig[field.key] ?? ''}
+                onChange={(event) =>
+                  setProviderConfig((prev) => ({ ...prev, [field.key]: event.target.value }))
+                }
+                placeholder={field.placeholder}
+                required
+              />
+            </label>
+          ))}
+
+          <button
+            type="submit"
+            disabled={providerSubmitting}
+            className="rounded-full bg-lime-400 px-4 py-2 text-sm font-bold uppercase tracking-widest text-black transition hover:bg-lime-300 disabled:opacity-50 sm:col-span-2"
+          >
+            {providerSubmitting ? 'Adding…' : 'Add provider'}
+          </button>
+        </form>
+
+        <h2 className="mb-4 text-sm uppercase tracking-widest text-white/50">
+          Provider pool ({providers?.length ?? 0})
+        </h2>
+
+        <div className="overflow-x-auto rounded-2xl border border-white/10">
+          <table className="w-full text-left text-sm">
+            <thead className="bg-white/5 text-xs uppercase tracking-widest text-white/50">
+              <tr>
+                <th className="px-4 py-3">Label</th>
+                <th className="px-4 py-3">Type</th>
+                <th className="px-4 py-3">Resolved URLs</th>
+                <th className="px-4 py-3">Status</th>
+                <th className="px-4 py-3">Latency</th>
+                <th className="px-4 py-3">Refresh</th>
+                <th className="px-4 py-3" />
+              </tr>
+            </thead>
+            <tbody>
+              {providers === null && (
+                <tr>
+                  <td colSpan={7} className="px-4 py-6 text-center text-white/40">
+                    Loading…
+                  </td>
+                </tr>
+              )}
+              {providers?.length === 0 && (
+                <tr>
+                  <td colSpan={7} className="px-4 py-6 text-center text-white/40">
+                    No providers yet — add one above.
+                  </td>
+                </tr>
+              )}
+              {providers?.map((provider) => (
+                <tr key={provider.id} className="border-t border-white/10 align-top">
+                  <td className="px-4 py-3 font-bold">{provider.label}</td>
+                  <td className="px-4 py-3 text-white/60">{TURN_PROVIDER_TYPES[provider.type].label}</td>
+                  <td className="px-4 py-3 text-white/60">
+                    {provider.urls.length === 0 && '—'}
+                    {provider.urls.map((url) => (
+                      <div key={url} className="whitespace-nowrap">
+                        {url}
+                      </div>
+                    ))}
+                  </td>
+                  <td className="px-4 py-3">
+                    <span
+                      className={`rounded-full border px-2 py-0.5 text-xs uppercase tracking-widest ${STATUS_STYLES[provider.status]}`}
+                    >
+                      {provider.status}
+                    </span>
+                    {provider.lastError && (
+                      <div className="mt-1 max-w-xs text-xs text-red-300/80">{provider.lastError}</div>
+                    )}
+                  </td>
+                  <td className="px-4 py-3 text-white/60">
+                    {provider.latencyMs !== null ? `${provider.latencyMs} ms` : '—'}
+                  </td>
+                  <td className="px-4 py-3 text-white/60">{formatExpiry(provider.expiresAt)}</td>
+                  <td className="px-4 py-3">
+                    <button
+                      onClick={() => handleDeleteProvider(provider.id)}
                       className="text-xs uppercase tracking-widest text-red-300/70 hover:text-red-300"
                     >
                       Delete

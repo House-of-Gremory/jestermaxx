@@ -1,4 +1,5 @@
 import { Redis } from '@upstash/redis';
+import type { TurnProviderType } from './turn-provider-types';
 
 export type SignalType = 'peer-joined' | 'offer' | 'answer' | 'candidate' | 'bye';
 
@@ -52,11 +53,32 @@ export type TurnServerRecord = {
   lastError: string | null;
 };
 
+// A broker (Xirsys, Metered, …) whose account-level credentials get
+// exchanged for actual relay urls/username/credential on a schedule, rather
+// than a fixed static credential like TurnServerRecord.
+export type TurnProviderRecord = {
+  id: string;
+  label: string;
+  type: TurnProviderType;
+  config: Record<string, string>;
+  // Last successfully resolved relay credentials (null until first resolve).
+  urls: string[];
+  username: string | null;
+  credential: string | null;
+  expiresAt: number | null;
+  createdAt: number;
+  status: TurnServerStatus;
+  latencyMs: number | null;
+  lastCheckedAt: number | null;
+  lastError: string | null;
+};
+
 export type Database = {
   rooms: RoomRecord[];
   participants: ParticipantRecord[];
   intros: IntroRecord[];
   turnServers: TurnServerRecord[];
+  turnProviders: TurnProviderRecord[];
 };
 
 const redis =
@@ -74,6 +96,7 @@ const localStore: Database = (globalStore.__jesterDb ??= {
   participants: [],
   intros: [],
   turnServers: [],
+  turnProviders: [],
 });
 
 // A single-attempt, non-retrying lock (unlike the read-modify-write lock
@@ -124,6 +147,7 @@ export async function withDatabase<T>(
     // object around from before a field (e.g. `intros`) was added here.
     localStore.intros ??= [];
     localStore.turnServers ??= [];
+    localStore.turnProviders ??= [];
     return operation({ data: localStore });
   }
 
@@ -134,9 +158,11 @@ export async function withDatabase<T>(
       participants: [],
       intros: [],
       turnServers: [],
+      turnProviders: [],
     };
     data.intros ??= [];
     data.turnServers ??= [];
+    data.turnProviders ??= [];
     const result = await operation({ data });
     await redis.set(REDIS_DATA_KEY, data, { ex: 60 * 60 });
     return result;
