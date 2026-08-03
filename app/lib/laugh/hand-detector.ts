@@ -1,4 +1,5 @@
 import type { HandLandmarker } from '@mediapipe/tasks-vision';
+import { withMediapipeLogsSilenced } from './face-detector';
 import type { HandPoint } from './types';
 
 // Lazily loaded, like the face model, so nothing ships in the initial bundle.
@@ -19,12 +20,15 @@ export class HandDetector {
   private lastVideoTime = -1;
 
   async init(): Promise<void> {
-    const vision = await loadVision();
-    const fileset = await vision.FilesetResolver.forVisionTasks(WASM_BASE);
-    this.landmarker = await vision.HandLandmarker.createFromOptions(fileset, {
-      baseOptions: { modelAssetPath: MODEL_URL, delegate: 'GPU' },
-      runningMode: 'VIDEO',
-      numHands: 2,
+    // Same benign TFLite/XNNPACK init chatter as the face model.
+    this.landmarker = await withMediapipeLogsSilenced(async () => {
+      const vision = await loadVision();
+      const fileset = await vision.FilesetResolver.forVisionTasks(WASM_BASE);
+      return vision.HandLandmarker.createFromOptions(fileset, {
+        baseOptions: { modelAssetPath: MODEL_URL, delegate: 'GPU' },
+        runningMode: 'VIDEO',
+        numHands: 2,
+      });
     });
   }
 
