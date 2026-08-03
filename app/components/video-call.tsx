@@ -52,10 +52,19 @@ type SignalMessage =
   // redelivers it, so a single dropped POST/poll would desync the scores for the
   // rest of the match. This resync makes that self-healing.
   | { type: 'score-sync'; payload: { conceded: number } }
+  // Final authoritative total, sent once when this peer's clock hits zero. Both
+  // peers decide the winner from the SAME two self-reported numbers, which is
+  // what guarantees the two verdicts are always opposites.
+  | { type: 'match-end'; payload: { conceded: number } }
+  // Sent by whoever abandons a live match: the leaver loses, the other wins.
+  | { type: 'forfeit' }
   | { type: 'relay-upgrade' };
 
 // How often each peer rebroadcasts its authoritative conceded-point total.
 const SCORE_SYNC_INTERVAL_MS = 2000;
+// How long to wait for the opponent's final total before falling back to the
+// last synced value (their clock may hit zero slightly after ours).
+const MATCH_END_GRACE_MS = 2500;
 
 const FALLBACK_ICE_SERVERS: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }];
 
@@ -162,6 +171,14 @@ export default function VideoCall() {
   // Latest scores, mirrored to a ref so the timer callback reads fresh values.
   const scoresRef = useRef({ you: 0, opp: 0 });
   const matchEndedRef = useRef(false);
+  // Opponent's own final total, from their 'match-end'. Null until it arrives.
+  const oppFinalConcededRef = useRef<number | null>(null);
+  // Our final total once our clock hits zero, held while we wait for theirs.
+  const myFinalConcededRef = useRef<number | null>(null);
+  const endGraceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Bridges to sendSignal (which lives inside the connection effect).
+  const sendMatchEndRef = useRef<((conceded: number) => void) | null>(null);
+  const sendForfeitRef = useRef<(() => void) | null>(null);
 
   const localVideoRef = useRef<HTMLVideoElement>(null);
   const remoteVideoRef = useRef<HTMLVideoElement>(null);
@@ -223,27 +240,86 @@ export default function VideoCall() {
     scoresRef.current = { you: youLaughed, opp: oppLaughed };
   }, [youLaughed, oppLaughed]);
 
+  const connectedRef = useRef(false);
+  useEffect(() => {
+    connectedRef.current = connected;
+  }, [connected]);
+
+  // Decides the match from BOTH peers' own authoritative totals: `myConceded` is
+  // how much I laughed, `theirConceded` how much they did. Each peer reports its
+  // own number, so both sides run this with identical inputs and therefore reach
+  // exactly opposite verdicts — there can never be two winners or two losers.
+  const finishMatch = useCallback((myConceded: number, theirConceded: number) => {
+    if (endGraceTimerRef.current) {
+      clearTimeout(endGraceTimerRef.current);
+      endGraceTimerRef.current = null;
+    }
+    setConnected(false); // freeze the match and stop detection
+    if (theirConceded === myConceded) {
+      excludeRoomIdRef.current = roomIdRef.current;
+      setStatus('Draw — finding a new opponent…');
+      setSessionId((value) => value + 1);
+      return;
+    }
+    setMatchResult(theirConceded > myConceded ? 'win' : 'lose');
+  }, []);
+
+  const finishMatchRef = useRef(finishMatch);
+  useEffect(() => {
+    finishMatchRef.current = finishMatch;
+  });
+
+  // Ends the match immediately because someone abandoned it.
+  const finishByForfeit = useCallback((outcome: 'win' | 'lose') => {
+    if (endGraceTimerRef.current) {
+      clearTimeout(endGraceTimerRef.current);
+      endGraceTimerRef.current = null;
+    }
+    matchEndedRef.current = true;
+    setConnected(false);
+    setMatchResult(outcome);
+    setStatus(
+      outcome === 'win' ? 'Opponent left the match — you win.' : 'You left the match — you lose.',
+    );
+  }, []);
+
+  const finishByForfeitRef = useRef(finishByForfeit);
+  useEffect(() => {
+    finishByForfeitRef.current = finishByForfeit;
+  });
+
   // 2-minute match timer. Starts when connected to an opponent. At zero: higher
   // score wins (win/lose screen + call ends); a tie auto-finds the next player.
   useEffect(() => {
     if (!connected) return;
     matchEndedRef.current = false;
+    oppFinalConcededRef.current = null;
+    myFinalConcededRef.current = null;
     const deadline = Date.now() + MATCH_DURATION_MS;
     const id = setInterval(() => {
       const remainMs = Math.max(0, deadline - Date.now());
       setTimeLeft(Math.ceil(remainMs / 1000));
       if (remainMs > 0 || matchEndedRef.current) return;
       matchEndedRef.current = true;
-      const { you, opp } = scoresRef.current; // opp = your points, you = theirs
-      if (opp === you) {
-        // Tie -> automatically queue the next opponent (same as "Next player").
-        excludeRoomIdRef.current = roomIdRef.current;
-        setStatus('Draw — finding a new opponent…');
-        setSessionId((value) => value + 1);
-      } else {
-        setConnected(false); // freeze the match + stop detection
-        setMatchResult(opp > you ? 'win' : 'lose');
+
+      // Publish our own final total, then decide once theirs is in. Deciding
+      // from both self-reported numbers (instead of our local scoreboard, which
+      // can be a couple of seconds stale) is what keeps the two verdicts
+      // consistent — previously both players could compute the same outcome.
+      const myConceded = scoresRef.current.you;
+      myFinalConcededRef.current = myConceded;
+      sendMatchEndRef.current?.(myConceded);
+
+      const theirFinal = oppFinalConcededRef.current;
+      if (theirFinal !== null) {
+        finishMatchRef.current(myConceded, theirFinal);
+        return;
       }
+      // Their clock may lag ours slightly; wait briefly, then fall back to the
+      // last value their periodic score-sync gave us.
+      endGraceTimerRef.current = setTimeout(() => {
+        finishMatchRef.current(myConceded, oppFinalConcededRef.current ?? scoresRef.current.opp);
+      }, MATCH_END_GRACE_MS);
     }, 250);
     return () => clearInterval(id);
   }, [connected]);
@@ -297,6 +373,10 @@ export default function VideoCall() {
     const scoreSyncTimer = setInterval(() => {
       void sendSignal({ type: 'score-sync', payload: { conceded: scoresRef.current.you } });
     }, SCORE_SYNC_INTERVAL_MS);
+
+    sendMatchEndRef.current = (conceded: number) =>
+      void sendSignal({ type: 'match-end', payload: { conceded } });
+    sendForfeitRef.current = () => void sendSignal({ type: 'forfeit' });
 
     // Looks up the opponent's saved intro reel (cache first) as soon as we
     // know who they are, so their reel — not our own — plays while we wait.
@@ -399,12 +479,37 @@ export default function VideoCall() {
         return;
       }
 
+      if (message.type === 'match-end') {
+        // Their authoritative final total. Decide as soon as we have both.
+        const conceded = Number(message.payload?.conceded);
+        if (!Number.isFinite(conceded)) return;
+        oppFinalConcededRef.current = conceded;
+        setOppLaughed((value) => Math.max(value, conceded));
+        const mine = myFinalConcededRef.current;
+        if (mine !== null) finishMatchRef.current(mine, conceded);
+        return;
+      }
+
+      if (message.type === 'forfeit') {
+        // They abandoned a live match, so we take the win.
+        if (connectedRef.current && !matchEndedRef.current) {
+          finishByForfeitRef.current('win');
+        }
+        return;
+      }
+
       if (message.type === 'bye') {
         // Opponent left the call. Clear their video/intro and prompt for a new one.
-        setConnected(false);
         setOpponentIntroRecord(null);
         setIntroHasPlayed(false);
         if (remoteVideoRef.current) remoteVideoRef.current.srcObject = null;
+        // A tab close or refresh mid-match only sends 'bye' (no forfeit), so it
+        // must award the win too — otherwise quitting would dodge the loss.
+        if (connectedRef.current && !matchEndedRef.current) {
+          finishByForfeitRef.current('win');
+          return;
+        }
+        setConnected(false);
         setStatus('Opponent left. Tap “Next player” to find someone new.');
         return;
       }
@@ -621,7 +726,13 @@ export default function VideoCall() {
       localStreamRef.current?.getTracks().forEach((track) => track.stop());
       localStreamRef.current = null;
       sendLaughRef.current = null;
+      sendMatchEndRef.current = null;
+      sendForfeitRef.current = null;
       clearInterval(scoreSyncTimer);
+      if (endGraceTimerRef.current) {
+        clearTimeout(endGraceTimerRef.current);
+        endGraceTimerRef.current = null;
+      }
       if (oppFlashTimerRef.current) clearTimeout(oppFlashTimerRef.current);
       if (youToastTimerRef.current) clearTimeout(youToastTimerRef.current);
       if (oppToastTimerRef.current) clearTimeout(oppToastTimerRef.current);
@@ -655,13 +766,25 @@ export default function VideoCall() {
   // room being left is excluded from the next match so you don't get rematched
   // with the same person.
   function nextPlayer() {
+    // Skipping a live match is a forfeit: the opponent gets the win. We move
+    // straight on to a new opponent rather than sitting on a result screen.
+    if (connectedRef.current && !matchEndedRef.current) {
+      sendForfeitRef.current?.();
+      matchEndedRef.current = true;
+    }
     excludeRoomIdRef.current = roomIdRef.current;
     setStatus('Finding a new opponent…');
     setSessionId((value) => value + 1);
   }
 
-  // End the call and go back to the name-entry menu (effect cleanup sends bye).
+  // Leaves the current match. Quitting mid-match is a loss for the leaver and a
+  // win for whoever stays, so show the loss instead of slipping back to the menu.
   function endCall() {
+    if (connectedRef.current && !matchEndedRef.current) {
+      sendForfeitRef.current?.();
+      finishByForfeit('lose');
+      return;
+    }
     excludeRoomIdRef.current = null;
     setStatus('');
     setUsername('');

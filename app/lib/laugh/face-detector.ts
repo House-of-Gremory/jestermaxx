@@ -16,19 +16,35 @@ function loadVision() {
 
 // MediaPipe's WASM prints TFLite/XNNPACK init lines through console.error even
 // though they are informational (e.g. "INFO: Created TensorFlow Lite XNNPACK
-// delegate for CPU."). Next's dev overlay then shows them as "Console Error".
-// Filter only those known-benign lines; everything else passes through.
-let consolePatched = false;
-function silenceMediapipeInfoLogs() {
-  if (consolePatched || typeof window === 'undefined') return;
-  consolePatched = true;
-  const benign = /Created TensorFlow Lite XNNPACK delegate|^INFO:|GL version|gl_context/i;
-  const patch = (original: (...args: unknown[]) => void) => (...args: unknown[]) => {
-    if (typeof args[0] === 'string' && benign.test(args[0])) return;
-    original(...args);
-  };
-  console.error = patch(console.error.bind(console));
-  console.info = patch(console.info.bind(console));
+// delegate for CPU."), which Next's dev overlay then reports as "Console Error".
+//
+// Those lines are only emitted while the model initializes, so the filter is
+// installed for exactly that window and always removed afterwards. An earlier
+// version replaced console.error/console.info permanently, which swallowed any
+// later message starting with "INFO:" (real errors included) and stacked extra
+// wrappers on every hot reload.
+const BENIGN_MEDIAPIPE_LOG = /Created TensorFlow Lite XNNPACK delegate|^INFO:|GL version|gl_context/i;
+
+export async function withMediapipeLogsSilenced<T>(operation: () => Promise<T>): Promise<T> {
+  if (typeof window === 'undefined') return operation();
+
+  const originalError = console.error;
+  const originalWarn = console.warn;
+  const filter =
+    (original: typeof console.error): typeof console.error =>
+    (...args) => {
+      if (typeof args[0] === 'string' && BENIGN_MEDIAPIPE_LOG.test(args[0])) return;
+      original(...args);
+    };
+
+  console.error = filter(originalError);
+  console.warn = filter(originalWarn);
+  try {
+    return await operation();
+  } finally {
+    console.error = originalError;
+    console.warn = originalWarn;
+  }
 }
 
 // MediaPipe 468-mesh indices around the lips (corners + inner/outer top/bottom).
@@ -39,14 +55,15 @@ export class FaceDetector {
   private lastVideoTime = -1;
 
   async init(): Promise<void> {
-    silenceMediapipeInfoLogs();
-    const vision = await loadVision();
-    const fileset = await vision.FilesetResolver.forVisionTasks(WASM_BASE);
-    this.landmarker = await vision.FaceLandmarker.createFromOptions(fileset, {
-      baseOptions: { modelAssetPath: MODEL_URL, delegate: 'GPU' },
-      runningMode: 'VIDEO',
-      numFaces: 1,
-      outputFaceBlendshapes: true,
+    this.landmarker = await withMediapipeLogsSilenced(async () => {
+      const vision = await loadVision();
+      const fileset = await vision.FilesetResolver.forVisionTasks(WASM_BASE);
+      return vision.FaceLandmarker.createFromOptions(fileset, {
+        baseOptions: { modelAssetPath: MODEL_URL, delegate: 'GPU' },
+        runningMode: 'VIDEO',
+        numFaces: 1,
+        outputFaceBlendshapes: true,
+      });
     });
   }
 
