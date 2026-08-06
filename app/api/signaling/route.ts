@@ -64,16 +64,40 @@ export async function POST(request: Request) {
     // Find the first room with a free slot. `excludeRoomId` is the room the
     // caller just left via "Next player" — skipping it stops them from being
     // immediately rematched with the same person they were just paired with.
-    const roomId = await withRoomIndex((rooms) => {
-      let room = rooms.find(
-        (candidate) => candidate.participantIds.length < 2 && candidate.id !== body.excludeRoomId,
-      );
-      if (!room) {
-        room = { id: createId('room'), participantIds: [], createdAt: Date.now() };
-        rooms.push(room);
+    //
+    // The index's participantIds is only ever touched on join/leave, so it can
+    // drift from reality (a participant who expired without a graceful 'bye',
+    // or a request that crashed mid-join). Reconcile each candidate against
+    // the live per-room store before trusting it — otherwise a room can look
+    // "full" of ghosts forever, permanently skipped by matchmaking while its
+    // one real occupant waits for an opponent that will never be routed in.
+    const cutoff = Date.now() - PARTICIPANT_TTL_MS;
+    const { roomId, existingParticipant } = await withRoomIndex(async (rooms) => {
+      for (let i = 0; i < rooms.length; i += 1) {
+        const candidate = rooms[i];
+        if (candidate.id === body.excludeRoomId) continue;
+
+        const live = await pruneRoomParticipants(candidate.id, cutoff);
+        candidate.participantIds = live.map((p) => p.id);
+
+        if (candidate.participantIds.length === 0) {
+          rooms.splice(i, 1);
+          i -= 1;
+          continue;
+        }
+        if (candidate.participantIds.length < 2) {
+          candidate.participantIds.push(participantId);
+          return { roomId: candidate.id, existingParticipant: live[0] as ParticipantRecord | undefined };
+        }
       }
-      room.participantIds.push(participantId);
-      return room.id;
+
+      const room: (typeof rooms)[number] = {
+        id: createId('room'),
+        participantIds: [participantId],
+        createdAt: Date.now(),
+      };
+      rooms.push(room);
+      return { roomId: room.id, existingParticipant: undefined };
     });
 
     const participant: ParticipantRecord = {
@@ -83,8 +107,6 @@ export async function POST(request: Request) {
       lastSeen: Date.now(),
     };
 
-    const existingParticipants = await pruneRoomParticipants(roomId, Date.now() - PARTICIPANT_TTL_MS);
-    const existingParticipant = existingParticipants[0] as ParticipantRecord | undefined;
     await upsertParticipant(participant);
     if (existingParticipant) {
       await pushMessage(roomId, existingParticipant.id, { type: 'peer-joined', payload: { username } });
