@@ -1,5 +1,9 @@
 import {
-  withRoom,
+  drainMessages,
+  pruneRoomParticipants,
+  pushMessage,
+  removeParticipant,
+  upsertParticipant,
   withRoomIndex,
   type ParticipantRecord,
   type SignalMessage,
@@ -16,11 +20,6 @@ function createId(prefix: string) {
 // single successful poll means the tab is really gone. Shorter than the old 30s
 // so ghost participants stop occupying rooms and blocking new matches.
 const PARTICIPANT_TTL_MS = 12_000;
-
-function pruneExpired(participants: ParticipantRecord[]): ParticipantRecord[] {
-  const cutoff = Date.now() - PARTICIPANT_TTL_MS;
-  return participants.filter((participant) => participant.lastSeen > cutoff);
-}
 
 // Best-effort: drop a room from the matchmaking index once it's actually
 // empty, so it stops being counted as "full" or getting matched into. Safe
@@ -81,19 +80,16 @@ export async function POST(request: Request) {
       id: participantId,
       roomId,
       username,
-      messages: [],
       lastSeen: Date.now(),
     };
 
-    const opponentUsername = await withRoom(roomId, (room) => {
-      room.participants = pruneExpired(room.participants);
-      const existingParticipant = room.participants[0] as ParticipantRecord | undefined;
-      room.participants.push(participant);
-      if (existingParticipant) {
-        existingParticipant.messages.push({ type: 'peer-joined', payload: { username } });
-      }
-      return existingParticipant?.username;
-    });
+    const existingParticipants = await pruneRoomParticipants(roomId, Date.now() - PARTICIPANT_TTL_MS);
+    const existingParticipant = existingParticipants[0] as ParticipantRecord | undefined;
+    await upsertParticipant(participant);
+    if (existingParticipant) {
+      await pushMessage(roomId, existingParticipant.id, { type: 'peer-joined', payload: { username } });
+    }
+    const opponentUsername = existingParticipant?.username;
 
     return Response.json({
       roomId,
@@ -112,27 +108,19 @@ export async function POST(request: Request) {
 
   const { roomId, participantId, message } = body;
 
-  const found = await withRoom(roomId, (room) => {
-    room.participants = pruneExpired(room.participants);
-    const participant = room.participants.find((candidate) => candidate.id === participantId);
-    if (!participant) return false;
-
-    participant.lastSeen = Date.now();
-    const otherParticipant = room.participants.find((candidate) => candidate.id !== participantId);
-    if (otherParticipant) otherParticipant.messages.push(message);
-
-    if (message.type === 'bye') {
-      room.participants = room.participants.filter((candidate) => candidate.id !== participantId);
-    }
-
-    return true;
-  });
-
-  if (!found) {
+  const participants = await pruneRoomParticipants(roomId, Date.now() - PARTICIPANT_TTL_MS);
+  const participant = participants.find((candidate) => candidate.id === participantId);
+  if (!participant) {
     return Response.json({ error: 'Room not found' }, { status: 404 });
   }
 
+  await upsertParticipant({ ...participant, lastSeen: Date.now() });
+
+  const otherParticipant = participants.find((candidate) => candidate.id !== participantId);
+  if (otherParticipant) await pushMessage(roomId, otherParticipant.id, message);
+
   if (message.type === 'bye') {
+    await removeParticipant(roomId, participantId);
     await releaseRoomFromIndex(roomId, participantId);
   }
 
@@ -148,22 +136,17 @@ export async function GET(request: Request) {
     return Response.json({ messages: [] }, { status: 404 });
   }
 
-  const { messages, isRoomEmpty } = await withRoom(roomId, (room) => {
-    room.participants = pruneExpired(room.participants);
-    const participant = room.participants.find((candidate) => candidate.id === participantId);
-    if (!participant) {
-      return { messages: null, isRoomEmpty: room.participants.length === 0 };
-    }
+  const participants = await pruneRoomParticipants(roomId, Date.now() - PARTICIPANT_TTL_MS);
+  const participant = participants.find((candidate) => candidate.id === participantId);
 
-    participant.lastSeen = Date.now();
-    const drained = participant.messages.splice(0, participant.messages.length);
-    return { messages: drained, isRoomEmpty: false };
-  });
+  if (!participant) {
+    // The participant expired (or the room emptied out) without a graceful
+    // 'bye' — reconcile the matchmaking index so the slot isn't stuck "full".
+    if (participants.length === 0) void releaseRoomFromIndex(roomId);
+    return Response.json({ messages: [] }, { status: 404 });
+  }
 
-  // The participant expired (or the room emptied out) without a graceful
-  // 'bye' — reconcile the matchmaking index so the slot isn't stuck "full".
-  if (isRoomEmpty) void releaseRoomFromIndex(roomId);
-
-  if (messages === null) return Response.json({ messages: [] }, { status: 404 });
+  await upsertParticipant({ ...participant, lastSeen: Date.now() });
+  const messages = await drainMessages(roomId, participantId);
   return Response.json({ messages });
 }

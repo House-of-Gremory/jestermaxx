@@ -12,7 +12,6 @@ export type ParticipantRecord = {
   id: string;
   roomId: string;
   username: string;
-  messages: SignalMessage[];
   lastSeen: number;
 };
 
@@ -83,12 +82,6 @@ export type Database = {
   turnProviders: TurnProviderRecord[];
 };
 
-// Per-room signaling data: the participants currently in a room and their
-// queued messages.
-export type RoomData = {
-  participants: ParticipantRecord[];
-};
-
 const redis =
   process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN
     ? Redis.fromEnv()
@@ -101,19 +94,29 @@ const REDIS_LOCK_KEY = 'jestermaxing:signaling:lock';
 const REDIS_ROOM_INDEX_KEY = 'jestermaxing:signaling:rooms';
 const REDIS_ROOM_INDEX_LOCK_KEY = 'jestermaxing:signaling:rooms:lock';
 
-function roomDataKey(roomId: string) {
-  return `jestermaxing:signaling:room:${roomId}`;
+function roomParticipantsKey(roomId: string) {
+  return `jestermaxing:signaling:room:${roomId}:participants`;
 }
-function roomLockKey(roomId: string) {
-  return `jestermaxing:signaling:room:${roomId}:lock`;
+function roomMessagesKey(roomId: string, participantId: string) {
+  return `jestermaxing:signaling:room:${roomId}:messages:${participantId}`;
 }
+
+// TTL refreshed on every write so an abandoned room's keys eventually expire
+// on their own — there's no single "delete the room" operation any more
+// (see the lock-free room store below), so this is what actually reclaims
+// dead rooms.
+const ROOM_KEY_TTL_SECONDS = 60 * 60;
 
 // Local development fallback. Vercel instances do not share process memory,
 // so production requires the shared Redis store configured above.
+type LocalRoom = {
+  participants: Map<string, ParticipantRecord>;
+  messages: Map<string, SignalMessage[]>;
+};
 const globalStore = globalThis as unknown as {
   __jesterDb?: Database;
   __jesterRooms?: RoomRecord[];
-  __jesterRoomData?: Map<string, RoomData>;
+  __jesterRoomData?: Map<string, LocalRoom>;
 };
 const localStore: Database = (globalStore.__jesterDb ??= {
   intros: [],
@@ -121,7 +124,16 @@ const localStore: Database = (globalStore.__jesterDb ??= {
   turnProviders: [],
 });
 const localRooms: RoomRecord[] = (globalStore.__jesterRooms ??= []);
-const localRoomData: Map<string, RoomData> = (globalStore.__jesterRoomData ??= new Map());
+const localRoomData: Map<string, LocalRoom> = (globalStore.__jesterRoomData ??= new Map());
+
+function getLocalRoom(roomId: string): LocalRoom {
+  let room = localRoomData.get(roomId);
+  if (!room) {
+    room = { participants: new Map(), messages: new Map() };
+    localRoomData.set(roomId, room);
+  }
+  return room;
+}
 
 // A single-attempt, non-retrying lock (unlike the read-modify-write lock
 // below, which retries). Used to let multiple server instances race to claim
@@ -215,33 +227,100 @@ export async function withRoomIndex<T>(
 }
 
 // Per-room signaling data (participants + their queued messages), scoped to
-// a single room's own Redis key/lock. Concurrent matches never lock against
-// each other, and a room's own 400ms polling never touches the matchmaking
-// index or the unrelated admin/config data above.
-export async function withRoom<T>(
-  roomId: string,
-  operation: (room: RoomData) => T | Promise<T>,
-): Promise<T> {
-  if (!redis) {
-    const room = localRoomData.get(roomId) ?? { participants: [] };
-    const result = await operation(room);
-    localRoomData.set(roomId, room);
-    return result;
-  }
+// a single room and backed by plain atomic Redis operations — a hash field
+// per participant and a message list per participant. Nothing here takes a
+// lock: each participant only ever writes their own hash field and RPUSHes
+// onto their peer's own list, so there's no read-modify-write race to guard
+// against. This matters because GET (poll, every 400ms per participant) and
+// POST (offer/answer/candidates/heartbeats) both hit this store constantly
+// during a call — funneling that through one app-level lock per room (the
+// previous design) serialized all of it behind a single mutex, and under
+// real call load (ICE candidate bursts + bidirectional polling) the queue
+// of waiters could outlast the lock's retry budget and throw.
 
-  const dataKey = roomDataKey(roomId);
-  const lockKey = roomLockKey(roomId);
-  const lockToken = await acquireLock(lockKey);
-  try {
-    const room = (await redis.get<RoomData>(dataKey)) ?? { participants: [] };
-    const result = await operation(room);
-    if (room.participants.length === 0) {
-      await redis.del(dataKey);
-    } else {
-      await redis.set(dataKey, room, { ex: 60 * 60 });
-    }
-    return result;
-  } finally {
-    await releaseLock(lockKey, lockToken);
+export async function getRoomParticipants(roomId: string): Promise<ParticipantRecord[]> {
+  if (!redis) {
+    return [...getLocalRoom(roomId).participants.values()];
   }
+  const raw = await redis.hgetall<Record<string, ParticipantRecord>>(roomParticipantsKey(roomId));
+  return raw ? Object.values(raw) : [];
+}
+
+// Only ever called by a participant to write their own record, so concurrent
+// callers never touch the same hash field.
+export async function upsertParticipant(participant: ParticipantRecord): Promise<void> {
+  if (!redis) {
+    getLocalRoom(participant.roomId).participants.set(participant.id, participant);
+    return;
+  }
+  const key = roomParticipantsKey(participant.roomId);
+  await redis.hset(key, { [participant.id]: participant });
+  await redis.expire(key, ROOM_KEY_TTL_SECONDS);
+}
+
+export async function removeParticipant(roomId: string, participantId: string): Promise<void> {
+  if (!redis) {
+    const room = getLocalRoom(roomId);
+    room.participants.delete(participantId);
+    room.messages.delete(participantId);
+    return;
+  }
+  await Promise.all([
+    redis.hdel(roomParticipantsKey(roomId), participantId),
+    redis.del(roomMessagesKey(roomId, participantId)),
+  ]);
+}
+
+// Drops participants that haven't polled/posted inside the TTL and returns
+// the ones still live. Best-effort and idempotent — concurrent callers
+// pruning the same stale entry just both no-op — so this needs no lock.
+export async function pruneRoomParticipants(
+  roomId: string,
+  cutoffMs: number,
+): Promise<ParticipantRecord[]> {
+  const all = await getRoomParticipants(roomId);
+  const live = all.filter((participant) => participant.lastSeen > cutoffMs);
+  const stale = all.filter((participant) => participant.lastSeen <= cutoffMs);
+  if (stale.length > 0) {
+    await Promise.all(stale.map((participant) => removeParticipant(roomId, participant.id)));
+  }
+  return live;
+}
+
+export async function pushMessage(
+  roomId: string,
+  participantId: string,
+  message: SignalMessage,
+): Promise<void> {
+  if (!redis) {
+    const room = getLocalRoom(roomId);
+    const queue = room.messages.get(participantId) ?? [];
+    queue.push(message);
+    room.messages.set(participantId, queue);
+    return;
+  }
+  const key = roomMessagesKey(roomId, participantId);
+  await redis.rpush(key, message);
+  await redis.expire(key, ROOM_KEY_TTL_SECONDS);
+}
+
+// Atomically returns and clears a participant's queued messages in one round
+// trip (LRANGE + DEL via a Lua script), so a poll can never see a message
+// twice or drop one to a race with a concurrent poll.
+const DRAIN_MESSAGES_SCRIPT = `
+local msgs = redis.call('LRANGE', KEYS[1], 0, -1)
+redis.call('DEL', KEYS[1])
+return msgs
+`;
+
+export async function drainMessages(roomId: string, participantId: string): Promise<SignalMessage[]> {
+  if (!redis) {
+    const room = getLocalRoom(roomId);
+    const queue = room.messages.get(participantId) ?? [];
+    room.messages.set(participantId, []);
+    return queue;
+  }
+  const key = roomMessagesKey(roomId, participantId);
+  const messages = await redis.eval<[], SignalMessage[]>(DRAIN_MESSAGES_SCRIPT, [key], []);
+  return messages ?? [];
 }
