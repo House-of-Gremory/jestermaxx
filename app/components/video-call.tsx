@@ -58,22 +58,53 @@ type SignalMessage =
   | { type: 'match-end'; payload: { conceded: number } }
   // Sent by whoever abandons a live match: the leaver loses, the other wins.
   | { type: 'forfeit' }
-  // A "gift": one player sends an Instagram post/reel that renders ONLY on the
-  // receiver's screen, as a distraction attack. Only the validated shortcode is
-  // sent — never a raw URL — so the receiver can never be pointed at an
-  // arbitrary origin by a crafted message.
-  | { type: 'gift'; payload: { shortcode: string } }
+  // A "gift": media that renders ONLY on the receiver's screen, as a distraction
+  // attack. Only a validated, structured descriptor is sent — never a raw URL —
+  // so a crafted message can never point the receiver at an arbitrary origin.
+  | { type: 'gift'; payload: GiftMedia }
   | { type: 'relay-upgrade' };
 
 // How often each peer rebroadcasts its authoritative conceded-point total.
 const SCORE_SYNC_INTERVAL_MS = 2000;
 
-// Accepts the usual Instagram post/reel/tv link shapes and returns just the
-// shortcode. Anything else (other hosts, junk text, javascript: URLs) returns
-// null, which is what keeps the embed iframe pinned to instagram.com.
-const INSTAGRAM_SHORTCODE = /^[A-Za-z0-9_-]{5,24}$/;
+// How long a received gift stays un-dismissable.
+const GIFT_LOCK_SECONDS = 6;
 
-function parseInstagramShortcode(input: string): string | null {
+// What a gift can be. Ordered by how well it actually plays on arrival:
+//  - 'video'/'image' are served by us in a native <video>/<img>, so they truly
+//    autoplay (muted+playsinline, which every browser allows).
+//  - 'youtube' autoplays muted via the iframe player.
+//  - 'instagram' embeds, but never autoplays: the player is inside a
+//    cross-origin iframe with no API to start it from here. Some posts
+//    (typically licensed-music reels) also ship no video in the embed at all
+//    and only render a "Watch on Instagram" link.
+type GiftMedia =
+  | { kind: 'youtube'; id: string }
+  | { kind: 'video'; url: string }
+  | { kind: 'image'; url: string }
+  | { kind: 'instagram'; shortcode: string };
+
+const SHORTCODE_RE = /^[A-Za-z0-9_-]{5,24}$/;
+const YOUTUBE_ID_RE = /^[A-Za-z0-9_-]{11}$/;
+
+// Re-validated on both send and receive: the result becomes a media/iframe URL,
+// so a crafted message must never be able to point it at an arbitrary origin.
+function isValidGift(gift: GiftMedia | null | undefined): gift is GiftMedia {
+  if (!gift || typeof gift !== 'object') return false;
+  if (gift.kind === 'youtube') return YOUTUBE_ID_RE.test(gift.id ?? '');
+  if (gift.kind === 'instagram') return SHORTCODE_RE.test(gift.shortcode ?? '');
+  if (gift.kind === 'video' || gift.kind === 'image') {
+    try {
+      // https only — no data:/javascript:/http: sneaking into a media element.
+      return new URL(gift.url).protocol === 'https:';
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+function parseGiftMedia(input: string): GiftMedia | null {
   const trimmed = input.trim();
   if (!trimmed) return null;
 
@@ -83,19 +114,35 @@ function parseInstagramShortcode(input: string): string | null {
   } catch {
     return null;
   }
+  if (url.protocol !== 'https:') return null;
 
   const host = url.hostname.replace(/^www\./, '');
-  if (host !== 'instagram.com' && !host.endsWith('.instagram.com')) return null;
-
   const segments = url.pathname.split('/').filter(Boolean);
-  const kindIndex = segments.findIndex((segment) =>
-    ['p', 'reel', 'reels', 'tv'].includes(segment),
-  );
-  if (kindIndex === -1) return null;
 
-  const shortcode = segments[kindIndex + 1];
-  if (!shortcode || !INSTAGRAM_SHORTCODE.test(shortcode)) return null;
-  return shortcode;
+  // YouTube: Shorts only — a full-length video is a poor "attack" and would sit
+  // there playing for minutes. Regular watch?v= / youtu.be links are rejected.
+  if (host === 'youtube.com' || host === 'm.youtube.com') {
+    const id = segments[0] === 'shorts' ? segments[1] : undefined;
+    return id && YOUTUBE_ID_RE.test(id) ? { kind: 'youtube', id } : null;
+  }
+
+  // Instagram — kept for convenience, but can only be offered as a link.
+  if (host === 'instagram.com' || host.endsWith('.instagram.com')) {
+    const kindIndex = segments.findIndex((segment) =>
+      ['p', 'reel', 'reels', 'tv'].includes(segment),
+    );
+    const shortcode = kindIndex === -1 ? undefined : segments[kindIndex + 1];
+    return shortcode && SHORTCODE_RE.test(shortcode)
+      ? { kind: 'instagram', shortcode }
+      : null;
+  }
+
+  // A direct file link (Giphy/Tenor/Imgur/any CDN) — the real autoplay path.
+  const path = url.pathname.toLowerCase();
+  if (/\.(mp4|webm|ogg|mov)$/.test(path)) return { kind: 'video', url: url.toString() };
+  if (/\.(gif|png|jpe?g|webp|avif)$/.test(path)) return { kind: 'image', url: url.toString() };
+
+  return null;
 }
 // How long to wait for the opponent's final total before falling back to the
 // last synced value (their clock may hit zero slightly after ours).
@@ -199,8 +246,11 @@ export default function VideoCall() {
   const [giftOpen, setGiftOpen] = useState(false);
   const [giftInput, setGiftInput] = useState('');
   const [giftError, setGiftError] = useState<string | null>(null);
-  const [incomingGift, setIncomingGift] = useState<string | null>(null);
-  const sendGiftRef = useRef<((shortcode: string) => void) | null>(null);
+  const [incomingGift, setIncomingGift] = useState<GiftMedia | null>(null);
+  // Seconds the receiver must sit with the gift before they may dismiss it —
+  // otherwise the "attack" is defused with an instant click.
+  const [giftCloseIn, setGiftCloseIn] = useState(0);
+  const sendGiftRef = useRef<((gift: GiftMedia) => void) | null>(null);
   const [connected, setConnected] = useState(false);
   // Laugh scoring. `oppLaughed` = times the opponent laughed = YOUR score (you
   // made them laugh). `youLaughed` = times you laughed. The local stream is kept
@@ -281,6 +331,15 @@ export default function VideoCall() {
     return () => clearTimeout(timer);
   }, []);
 
+  // Counts the gift lock down to zero, at which point the close button appears.
+  // The initial value is set when the gift arrives, so nothing is set here
+  // synchronously during the effect body.
+  useEffect(() => {
+    if (!incomingGift || giftCloseIn <= 0) return;
+    const id = setTimeout(() => setGiftCloseIn((value) => Math.max(0, value - 1)), 1000);
+    return () => clearTimeout(id);
+  }, [incomingGift, giftCloseIn]);
+
   // Keep a fresh copy of the scores for the timer callback to read.
   useEffect(() => {
     scoresRef.current = { you: youLaughed, opp: oppLaughed };
@@ -290,6 +349,36 @@ export default function VideoCall() {
   useEffect(() => {
     connectedRef.current = connected;
   }, [connected]);
+
+  // Exits the room without tearing the call screen down: stops polling, frees
+  // our slot server-side, and clears the ids so nothing further is sent. Used
+  // when a result screen goes up, so we stop being matchable until the player
+  // chooses "Play again" or "Back to menu". Touches only refs, so it needs no
+  // dependencies and never goes stale.
+  const leaveRoom = useCallback(() => {
+    const roomId = roomIdRef.current;
+    const participantId = participantIdRef.current;
+    if (!roomId || !participantId) return;
+
+    stoppedRef.current = true;
+    if (pollTimerRef.current) {
+      clearTimeout(pollTimerRef.current);
+      pollTimerRef.current = null;
+    }
+    void fetch('/api/signaling', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ participantId, roomId, message: { type: 'bye' } }),
+    }).catch(() => {
+      // Best effort: the server also expires abandoned participants on its own.
+    });
+
+    // Remember the room we just left so "Play again" cannot immediately
+    // rematch us with the same opponent.
+    excludeRoomIdRef.current = roomId;
+    roomIdRef.current = null;
+    participantIdRef.current = null;
+  }, []);
 
   // Decides the match from BOTH peers' own authoritative totals: `myConceded` is
   // how much I laughed, `theirConceded` how much they did. Each peer reports its
@@ -307,8 +396,13 @@ export default function VideoCall() {
       setSessionId((value) => value + 1);
       return;
     }
+    // Leave the room before showing the result. Otherwise we stay a member of
+    // the matchmaking pool: once the opponent leaves, the room has a free slot
+    // and the next player to join gets paired with us while we are still
+    // sitting on the win/lose screen.
+    leaveRoom();
     setMatchResult(theirConceded > myConceded ? 'win' : 'lose');
-  }, []);
+  }, [leaveRoom]);
 
   const finishMatchRef = useRef(finishMatch);
   useEffect(() => {
@@ -323,13 +417,17 @@ export default function VideoCall() {
     }
     matchEndedRef.current = true;
     setConnected(false);
+    // Same reason as in finishMatch: stop being matchable while the result
+    // screen is up.
+    leaveRoom();
     setMatchResult(outcome);
     setStatus(
       outcome === 'win' ? 'Opponent left the match — you win.' : 'You left the match — you lose.',
     );
-  }, []);
+  }, [leaveRoom]);
 
   const finishByForfeitRef = useRef(finishByForfeit);
+
   useEffect(() => {
     finishByForfeitRef.current = finishByForfeit;
   });
@@ -425,8 +523,8 @@ export default function VideoCall() {
     sendLaughRef.current = (event: LaughEvent) => void sendSignal({ type: 'laugh', payload: event });
 
     // Delivers a gift to the opponent only — nothing renders on the sender.
-    sendGiftRef.current = (shortcode: string) =>
-      void sendSignal({ type: 'gift', payload: { shortcode } });
+    sendGiftRef.current = (gift: GiftMedia) =>
+      void sendSignal({ type: 'gift', payload: gift });
 
     // Each peer is authoritative for how much IT laughed, and rebroadcasts that
     // running total. If a one-shot 'laugh' message is ever dropped, the next
@@ -533,11 +631,11 @@ export default function VideoCall() {
       }
 
       if (message.type === 'gift') {
-        // Re-validate on arrival: the shortcode is about to become part of an
-        // iframe URL, so never trust the shape the peer claims to have sent.
-        const shortcode = message.payload?.shortcode;
-        if (typeof shortcode === 'string' && INSTAGRAM_SHORTCODE.test(shortcode)) {
-          setIncomingGift(shortcode);
+        // Re-validate on arrival: this is about to become a media/iframe URL,
+        // so never trust the shape the peer claims to have sent.
+        if (isValidGift(message.payload)) {
+          setIncomingGift(message.payload);
+          setGiftCloseIn(GIFT_LOCK_SECONDS);
         }
         return;
       }
@@ -676,6 +774,7 @@ export default function VideoCall() {
       setGiftInput('');
       setGiftError(null);
       setIncomingGift(null);
+      setGiftCloseIn(0);
       setOpponentIntroRecord(null);
       setIntroHasPlayed(false);
       try {
@@ -852,13 +951,13 @@ export default function VideoCall() {
   function sendGift() {
     if (giftUsed || !connected) return;
 
-    const shortcode = parseInstagramShortcode(giftInput);
-    if (!shortcode) {
-      setGiftError('Paste a full Instagram post or reel link.');
+    const gift = parseGiftMedia(giftInput);
+    if (!gift) {
+      setGiftError('Paste an Instagram post/reel, a YouTube Short, or a direct .mp4/.gif link.');
       return;
     }
 
-    sendGiftRef.current?.(shortcode);
+    sendGiftRef.current?.(gift);
     setGiftUsed(true);
     setGiftOpen(false);
     setGiftInput('');
@@ -872,7 +971,9 @@ export default function VideoCall() {
       sendForfeitRef.current?.();
       matchEndedRef.current = true;
     }
-    excludeRoomIdRef.current = roomIdRef.current;
+    // If we already left the room (a result screen went up), leaveRoom has
+    // recorded the room to avoid — don't overwrite it with the now-null id.
+    if (roomIdRef.current) excludeRoomIdRef.current = roomIdRef.current;
     setStatus('Finding a new opponent…');
     setSessionId((value) => value + 1);
   }
@@ -1043,8 +1144,8 @@ export default function VideoCall() {
                     onKeyDown={(event) => {
                       if (event.key === 'Enter') sendGift();
                     }}
-                    placeholder="https://www.instagram.com/reel/…"
-                    aria-label="Instagram link"
+                    placeholder="YouTube / .mp4 / .gif link…"
+                    aria-label="Gift media link"
                     className="min-w-0 flex-1 rounded-xl border border-white/15 bg-black/40 px-4 py-2.5 text-sm text-white outline-none transition focus:border-fuchsia-400"
                   />
                   <button
@@ -1097,24 +1198,72 @@ export default function VideoCall() {
               <span className="text-[10px] font-bold uppercase tracking-widest text-fuchsia-300">
                 🎁 Gift from your opponent
               </span>
-              <button
-                onClick={() => setIncomingGift(null)}
-                aria-label="Close gift"
-                className="text-lg leading-none text-white/40 transition hover:text-white"
-              >
-                ×
-              </button>
+              {giftCloseIn > 0 ? (
+                <span
+                  aria-live="polite"
+                  className="rounded-md bg-white/10 px-2 py-0.5 text-[10px] font-bold tabular-nums text-white/40"
+                >
+                  {giftCloseIn}s
+                </span>
+              ) : (
+                <button
+                  onClick={() => setIncomingGift(null)}
+                  aria-label="Close gift"
+                  className="text-lg leading-none text-white/40 transition hover:text-white"
+                >
+                  ×
+                </button>
+              )}
             </div>
-            <iframe
-              // Built from a validated shortcode only, so this can never be
-              // pointed at an origin other than instagram.com.
-              src={`https://www.instagram.com/p/${incomingGift}/embed`}
-              title="Instagram gift"
-              className="h-[420px] w-full border-0 bg-black"
-              allow="autoplay; encrypted-media; picture-in-picture"
-              allowFullScreen
-              sandbox="allow-scripts allow-same-origin allow-popups allow-presentation"
-            />
+            {/* muted + playsInline is what makes autoplay actually permitted. */}
+            {incomingGift.kind === 'video' && (
+              <video
+                src={incomingGift.url}
+                autoPlay
+                muted
+                loop
+                playsInline
+                controls
+                className="max-h-[60vh] w-full bg-black"
+              />
+            )}
+
+            {incomingGift.kind === 'image' && (
+              // Arbitrary remote host chosen at runtime, so next/image (which
+              // needs its domains configured up front) can't be used here.
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                src={incomingGift.url}
+                alt="Gift from your opponent"
+                className="max-h-[60vh] w-full bg-black object-contain"
+              />
+            )}
+
+            {incomingGift.kind === 'youtube' && (
+              <iframe
+                // Built from a validated 11-char video id only.
+                src={`https://www.youtube-nocookie.com/embed/${incomingGift.id}?autoplay=1&mute=1&playsinline=1`}
+                title="Gift from your opponent"
+                className="aspect-video w-full border-0 bg-black"
+                allow="autoplay; encrypted-media; picture-in-picture"
+                allowFullScreen
+              />
+            )}
+
+            {incomingGift.kind === 'instagram' && (
+              // Instagram's player is inside a cross-origin iframe, so playback
+              // cannot be started from here — there is no API to call into it.
+              // Some posts (typically licensed-music reels) also ship no video
+              // in the embed at all and only offer "Watch on Instagram".
+              <iframe
+                // Built from a validated shortcode only.
+                src={`https://www.instagram.com/p/${incomingGift.shortcode}/embed`}
+                title="Gift from your opponent"
+                className="h-[420px] w-full border-0 bg-black"
+                allow="autoplay; encrypted-media; picture-in-picture"
+                allowFullScreen
+              />
+            )}
           </div>
         </div>
       )}
