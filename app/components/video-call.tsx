@@ -28,7 +28,7 @@ function fmtScore(n: number): string {
 }
 
 // Each match lasts this long once both players are connected.
-const MATCH_DURATION_MS = 120_000;
+const MATCH_DURATION_MS = 180_000;
 
 function fmtTime(seconds: number): string {
   const m = Math.floor(seconds / 60);
@@ -58,10 +58,45 @@ type SignalMessage =
   | { type: 'match-end'; payload: { conceded: number } }
   // Sent by whoever abandons a live match: the leaver loses, the other wins.
   | { type: 'forfeit' }
+  // A "gift": one player sends an Instagram post/reel that renders ONLY on the
+  // receiver's screen, as a distraction attack. Only the validated shortcode is
+  // sent — never a raw URL — so the receiver can never be pointed at an
+  // arbitrary origin by a crafted message.
+  | { type: 'gift'; payload: { shortcode: string } }
   | { type: 'relay-upgrade' };
 
 // How often each peer rebroadcasts its authoritative conceded-point total.
 const SCORE_SYNC_INTERVAL_MS = 2000;
+
+// Accepts the usual Instagram post/reel/tv link shapes and returns just the
+// shortcode. Anything else (other hosts, junk text, javascript: URLs) returns
+// null, which is what keeps the embed iframe pinned to instagram.com.
+const INSTAGRAM_SHORTCODE = /^[A-Za-z0-9_-]{5,24}$/;
+
+function parseInstagramShortcode(input: string): string | null {
+  const trimmed = input.trim();
+  if (!trimmed) return null;
+
+  let url: URL;
+  try {
+    url = new URL(trimmed.startsWith('http') ? trimmed : `https://${trimmed}`);
+  } catch {
+    return null;
+  }
+
+  const host = url.hostname.replace(/^www\./, '');
+  if (host !== 'instagram.com' && !host.endsWith('.instagram.com')) return null;
+
+  const segments = url.pathname.split('/').filter(Boolean);
+  const kindIndex = segments.findIndex((segment) =>
+    ['p', 'reel', 'reels', 'tv'].includes(segment),
+  );
+  if (kindIndex === -1) return null;
+
+  const shortcode = segments[kindIndex + 1];
+  if (!shortcode || !INSTAGRAM_SHORTCODE.test(shortcode)) return null;
+  return shortcode;
+}
 // How long to wait for the opponent's final total before falling back to the
 // last synced value (their clock may hit zero slightly after ours).
 const MATCH_END_GRACE_MS = 2500;
@@ -155,6 +190,17 @@ export default function VideoCall() {
   // Bumping this re-runs the connection effect without leaving the call screen,
   // which is how "Next player" tears down the current peer and finds a new one.
   const [sessionId, setSessionId] = useState(0);
+  // Incremented on every (re)connect so async work started for an earlier match
+  // can detect that it is stale and drop its result instead of applying it.
+  const sessionEpochRef = useRef(0);
+  // Gift attack: one send per player per match. `giftOpen` toggles the paste bar,
+  // `incomingGift` is the shortcode to embed (set only on the RECEIVING side).
+  const [giftUsed, setGiftUsed] = useState(false);
+  const [giftOpen, setGiftOpen] = useState(false);
+  const [giftInput, setGiftInput] = useState('');
+  const [giftError, setGiftError] = useState<string | null>(null);
+  const [incomingGift, setIncomingGift] = useState<string | null>(null);
+  const sendGiftRef = useRef<((shortcode: string) => void) | null>(null);
   const [connected, setConnected] = useState(false);
   // Laugh scoring. `oppLaughed` = times the opponent laughed = YOUR score (you
   // made them laugh). `youLaughed` = times you laughed. The local stream is kept
@@ -327,6 +373,18 @@ export default function VideoCall() {
   useEffect(() => {
     if (!username) return;
 
+    // Every (re)connect gets its own epoch. A poll started for a previous match
+    // can still resolve after "Play again" has already reset the scoreboard;
+    // because opponent points are merged with Math.max (monotonic, so a late
+    // message can only push them UP), such a straggler used to resurrect the
+    // finished match's score. That only ever hit the winner, whose big number
+    // lives in oppLaughed — the loser's lives in youLaughed, which has no max
+    // guard and so always reset cleanly. Stamping the epoch lets stale work be
+    // discarded instead of applied to the new match.
+    sessionEpochRef.current += 1;
+    const epoch = sessionEpochRef.current;
+    const isStale = () => sessionEpochRef.current !== epoch;
+
     stoppedRef.current = false;
     pendingCandidatesRef.current = [];
     isCallerRef.current = false;
@@ -365,6 +423,10 @@ export default function VideoCall() {
 
     // Expose a laugh sender to the detector callback living in component scope.
     sendLaughRef.current = (event: LaughEvent) => void sendSignal({ type: 'laugh', payload: event });
+
+    // Delivers a gift to the opponent only — nothing renders on the sender.
+    sendGiftRef.current = (shortcode: string) =>
+      void sendSignal({ type: 'gift', payload: { shortcode } });
 
     // Each peer is authoritative for how much IT laughed, and rebroadcasts that
     // running total. If a one-shot 'laugh' message is ever dropped, the next
@@ -470,6 +532,16 @@ export default function VideoCall() {
         return;
       }
 
+      if (message.type === 'gift') {
+        // Re-validate on arrival: the shortcode is about to become part of an
+        // iframe URL, so never trust the shape the peer claims to have sent.
+        const shortcode = message.payload?.shortcode;
+        if (typeof shortcode === 'string' && INSTAGRAM_SHORTCODE.test(shortcode)) {
+          setIncomingGift(shortcode);
+        }
+        return;
+      }
+
       if (message.type === 'score-sync') {
         // The opponent is authoritative for how much they laughed. Taking the
         // max keeps this monotonic and idempotent, so repeated or out-of-order
@@ -568,6 +640,9 @@ export default function VideoCall() {
         );
         if (response.ok) {
           const data = (await response.json()) as { messages: SignalMessage[] };
+          // This response may have been in flight while the match ended and a
+          // new one started. Applying it now would corrupt the fresh scoreboard.
+          if (isStale()) return;
           for (const message of data.messages) {
             try {
               await handleSignal(message);
@@ -582,7 +657,7 @@ export default function VideoCall() {
         console.error('Signaling poll error', error);
       }
 
-      if (!stoppedRef.current) {
+      if (!stoppedRef.current && !isStale()) {
         pollTimerRef.current = setTimeout(pollSignals, POLL_INTERVAL_MS);
       }
     }
@@ -595,6 +670,12 @@ export default function VideoCall() {
       setOppToast(null);
       setMatchResult(null);
       setTimeLeft(MATCH_DURATION_MS / 1000);
+      // Each new match (including "Next player") restores both players' gift.
+      setGiftUsed(false);
+      setGiftOpen(false);
+      setGiftInput('');
+      setGiftError(null);
+      setIncomingGift(null);
       setOpponentIntroRecord(null);
       setIntroHasPlayed(false);
       try {
@@ -726,6 +807,7 @@ export default function VideoCall() {
       localStreamRef.current?.getTracks().forEach((track) => track.stop());
       localStreamRef.current = null;
       sendLaughRef.current = null;
+      sendGiftRef.current = null;
       sendMatchEndRef.current = null;
       sendForfeitRef.current = null;
       clearInterval(scoreSyncTimer);
@@ -765,6 +847,24 @@ export default function VideoCall() {
   // Leave the current opponent and immediately look for a different one. The
   // room being left is excluded from the next match so you don't get rematched
   // with the same person.
+  // Spend this player's single gift: validate the pasted Instagram link and
+  // relay only the shortcode, so the post renders on the opponent's screen.
+  function sendGift() {
+    if (giftUsed || !connected) return;
+
+    const shortcode = parseInstagramShortcode(giftInput);
+    if (!shortcode) {
+      setGiftError('Paste a full Instagram post or reel link.');
+      return;
+    }
+
+    sendGiftRef.current?.(shortcode);
+    setGiftUsed(true);
+    setGiftOpen(false);
+    setGiftInput('');
+    setGiftError(null);
+  }
+
   function nextPlayer() {
     // Skipping a live match is a forfeit: the opponent gets the win. We move
     // straight on to a new opponent rather than sitting on a result screen.
@@ -930,7 +1030,47 @@ export default function VideoCall() {
               🔒 Audio is analyzed on your device to detect laughs — never recorded or uploaded.
             </p>
 
+            {/* Gift attack: one send per player. Opening reveals the paste bar. */}
+            {giftOpen && !giftUsed && (
+              <div className="mx-auto mt-4 w-full max-w-md">
+                <div className="flex gap-2">
+                  <input
+                    value={giftInput}
+                    onChange={(event) => {
+                      setGiftInput(event.target.value);
+                      setGiftError(null);
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter') sendGift();
+                    }}
+                    placeholder="https://www.instagram.com/reel/…"
+                    aria-label="Instagram link"
+                    className="min-w-0 flex-1 rounded-xl border border-white/15 bg-black/40 px-4 py-2.5 text-sm text-white outline-none transition focus:border-fuchsia-400"
+                  />
+                  <button
+                    onClick={sendGift}
+                    className="rounded-xl bg-fuchsia-500 px-5 py-2.5 text-sm font-black uppercase tracking-widest text-white transition hover:bg-fuchsia-400"
+                  >
+                    Send
+                  </button>
+                </div>
+                {giftError && <p className="mt-2 text-xs text-red-400">{giftError}</p>}
+              </div>
+            )}
+
             <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
+              <button
+                onClick={() => setGiftOpen((open) => !open)}
+                disabled={giftUsed || !connected}
+                title={
+                  giftUsed
+                    ? 'You have already sent your gift this match'
+                    : 'One gift per player — it plays on your opponent’s screen'
+                }
+                className="rounded-xl border border-fuchsia-400/50 bg-fuchsia-500/10 px-6 py-3 text-sm font-black uppercase tracking-widest text-fuchsia-300 transition hover:bg-fuchsia-500/20 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/5 disabled:text-white/30"
+              >
+                {giftUsed ? '🎁 Gift sent' : giftOpen ? '🎁 Cancel' : '🎁 Send gift'}
+              </button>
               <button
                 onClick={nextPlayer}
                 className="rounded-xl bg-fuchsia-500 px-6 py-3 text-sm font-black uppercase tracking-widest text-white transition hover:bg-fuchsia-400"
@@ -947,6 +1087,37 @@ export default function VideoCall() {
           </section>
         )}
       </div>
+
+      {/* Incoming gift — rendered ONLY on the receiving side. Compact and
+          centered so both camera tiles stay visible behind it. */}
+      {incomingGift && (
+        <div className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center px-6">
+          <div className="pointer-events-auto w-full max-w-sm overflow-hidden rounded-2xl border border-fuchsia-400/50 bg-[#07060a]/95 shadow-[0_0_40px_rgba(217,70,239,0.3)] backdrop-blur">
+            <div className="flex items-center justify-between gap-4 px-4 py-2.5">
+              <span className="text-[10px] font-bold uppercase tracking-widest text-fuchsia-300">
+                🎁 Gift from your opponent
+              </span>
+              <button
+                onClick={() => setIncomingGift(null)}
+                aria-label="Close gift"
+                className="text-lg leading-none text-white/40 transition hover:text-white"
+              >
+                ×
+              </button>
+            </div>
+            <iframe
+              // Built from a validated shortcode only, so this can never be
+              // pointed at an origin other than instagram.com.
+              src={`https://www.instagram.com/p/${incomingGift}/embed`}
+              title="Instagram gift"
+              className="h-[420px] w-full border-0 bg-black"
+              allow="autoplay; encrypted-media; picture-in-picture"
+              allowFullScreen
+              sandbox="allow-scripts allow-same-origin allow-popups allow-presentation"
+            />
+          </div>
+        </div>
+      )}
 
       {matchResult && (
         <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-8 bg-[#07060a]/95 px-6 text-center backdrop-blur">
