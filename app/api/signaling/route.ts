@@ -1,4 +1,9 @@
-import { withDatabase, type Database, type SignalMessage } from '@/lib/db';
+import {
+  withRoom,
+  withRoomIndex,
+  type ParticipantRecord,
+  type SignalMessage,
+} from '@/lib/db';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
@@ -12,25 +17,31 @@ function createId(prefix: string) {
 // so ghost participants stop occupying rooms and blocking new matches.
 const PARTICIPANT_TTL_MS = 12_000;
 
-function removeExpiredParticipants(database: { data: Database }) {
+function pruneExpired(participants: ParticipantRecord[]): ParticipantRecord[] {
   const cutoff = Date.now() - PARTICIPANT_TTL_MS;
-  const expiredIds = new Set(
-    database.data.participants
-      .filter((participant) => participant.lastSeen <= cutoff)
-      .map((participant) => participant.id),
-  );
+  return participants.filter((participant) => participant.lastSeen > cutoff);
+}
 
-  database.data.participants = database.data.participants.filter(
-    (participant) => !expiredIds.has(participant.id),
-  );
-
-  for (const room of database.data.rooms) {
-    room.participantIds = room.participantIds.filter((participantId) => !expiredIds.has(participantId));
+// Best-effort: drop a room from the matchmaking index once it's actually
+// empty, so it stops being counted as "full" or getting matched into. Safe
+// to skip on failure — the index self-heals the next time join() encounters
+// a stale full room.
+async function releaseRoomFromIndex(roomId: string, participantId?: string) {
+  try {
+    await withRoomIndex((rooms) => {
+      const room = rooms.find((candidate) => candidate.id === roomId);
+      if (!room) return;
+      if (participantId) {
+        room.participantIds = room.participantIds.filter((id) => id !== participantId);
+      }
+      if (room.participantIds.length === 0) {
+        const index = rooms.indexOf(room);
+        rooms.splice(index, 1);
+      }
+    });
+  } catch (error) {
+    console.error('Failed to release room from matchmaking index', roomId, error);
   }
-
-  database.data.rooms = database.data.rooms.filter(
-    (room) => room.participantIds.length > 0,
-  );
 }
 
 export async function POST(request: Request) {
@@ -43,93 +54,89 @@ export async function POST(request: Request) {
     excludeRoomId?: string;
   };
 
-  return await withDatabase((database) => {
-    removeExpiredParticipants(database);
+  if (body.action === 'join') {
+    const username = body.username?.trim();
+    if (!username || username.length > 32) {
+      return Response.json({ error: 'Username must be 1-32 characters' }, { status: 400 });
+    }
 
-    if (body.action === 'join') {
-      const username = body.username?.trim();
-      if (!username || username.length > 32) {
-        return Response.json({ error: 'Username must be 1-32 characters' }, { status: 400 });
-      }
+    const participantId = createId('person');
 
-      // Find the first room with a free slot. `excludeRoomId` is the room the
-      // caller just left via "Next player" — skipping it stops them from being
-      // immediately rematched with the same person they were just paired with.
-      let room = database.data.rooms.find(
-        (candidate) =>
-          candidate.participantIds.length < 2 && candidate.id !== body.excludeRoomId,
+    // Find the first room with a free slot. `excludeRoomId` is the room the
+    // caller just left via "Next player" — skipping it stops them from being
+    // immediately rematched with the same person they were just paired with.
+    const roomId = await withRoomIndex((rooms) => {
+      let room = rooms.find(
+        (candidate) => candidate.participantIds.length < 2 && candidate.id !== body.excludeRoomId,
       );
       if (!room) {
-        room = {
-          id: createId('room'),
-          participantIds: [],
-          createdAt: Date.now(),
-        };
-        database.data.rooms.push(room);
+        room = { id: createId('room'), participantIds: [], createdAt: Date.now() };
+        rooms.push(room);
       }
+      room.participantIds.push(participantId);
+      return room.id;
+    });
 
-      const participant = {
-        id: createId('person'),
-        roomId: room.id,
-        username,
-        messages: [] as SignalMessage[],
-        lastSeen: Date.now(),
-      };
-      const existingParticipant = database.data.participants.find(
-        (candidate) => candidate.id === room?.participantIds[0],
-      );
+    const participant: ParticipantRecord = {
+      id: participantId,
+      roomId,
+      username,
+      messages: [],
+      lastSeen: Date.now(),
+    };
 
-      room.participantIds.push(participant.id);
-      database.data.participants.push(participant);
-
+    const opponentUsername = await withRoom(roomId, (room) => {
+      room.participants = pruneExpired(room.participants);
+      const existingParticipant = room.participants[0] as ParticipantRecord | undefined;
+      room.participants.push(participant);
       if (existingParticipant) {
-        existingParticipant.messages.push({
-          type: 'peer-joined',
-          payload: { username },
-        });
+        existingParticipant.messages.push({ type: 'peer-joined', payload: { username } });
       }
+      return existingParticipant?.username;
+    });
 
-      return Response.json({
-        roomId: room.id,
-        participantId: participant.id,
-        username,
-        waiting: room.participantIds.length === 1,
-        // Lets the second joiner show the first joiner's intro reel
-        // immediately, without waiting on a signaling round trip.
-        opponentUsername: existingParticipant?.username,
-      });
-    }
+    return Response.json({
+      roomId,
+      participantId,
+      username,
+      waiting: opponentUsername === undefined,
+      // Lets the second joiner show the first joiner's intro reel
+      // immediately, without waiting on a signaling round trip.
+      opponentUsername,
+    });
+  }
 
-    if (!body.roomId || !body.participantId || !body.message) {
-      return Response.json({ error: 'Invalid signaling request' }, { status: 400 });
-    }
+  if (!body.roomId || !body.participantId || !body.message) {
+    return Response.json({ error: 'Invalid signaling request' }, { status: 400 });
+  }
 
-    const participant = database.data.participants.find(
-      (candidate) => candidate.id === body.participantId && candidate.roomId === body.roomId,
-    );
-    const room = database.data.rooms.find((candidate) => candidate.id === body.roomId);
-    if (!participant || !room) {
-      return Response.json({ error: 'Room not found' }, { status: 404 });
-    }
+  const { roomId, participantId, message } = body;
+
+  const found = await withRoom(roomId, (room) => {
+    room.participants = pruneExpired(room.participants);
+    const participant = room.participants.find((candidate) => candidate.id === participantId);
+    if (!participant) return false;
 
     participant.lastSeen = Date.now();
-    const otherParticipant = database.data.participants.find(
-      (candidate) => candidate.roomId === room.id && candidate.id !== participant.id,
-    );
-    if (otherParticipant) otherParticipant.messages.push(body.message);
+    const otherParticipant = room.participants.find((candidate) => candidate.id !== participantId);
+    if (otherParticipant) otherParticipant.messages.push(message);
 
-    if (body.message.type === 'bye') {
-      room.participantIds = room.participantIds.filter((id) => id !== participant.id);
-      database.data.participants = database.data.participants.filter(
-        (candidate) => candidate.id !== participant.id,
-      );
-      if (room.participantIds.length === 0) {
-        database.data.rooms = database.data.rooms.filter((candidate) => candidate.id !== room.id);
-      }
+    if (message.type === 'bye') {
+      room.participants = room.participants.filter((candidate) => candidate.id !== participantId);
     }
 
-    return Response.json({ ok: true });
+    return true;
   });
+
+  if (!found) {
+    return Response.json({ error: 'Room not found' }, { status: 404 });
+  }
+
+  if (message.type === 'bye') {
+    await releaseRoomFromIndex(roomId, participantId);
+  }
+
+  return Response.json({ ok: true });
 }
 
 export async function GET(request: Request) {
@@ -137,16 +144,26 @@ export async function GET(request: Request) {
   const roomId = url.searchParams.get('roomId');
   const participantId = url.searchParams.get('participantId');
 
-  return await withDatabase((database) => {
-    removeExpiredParticipants(database);
-    const participant = database.data.participants.find(
-      (candidate) => candidate.id === participantId && candidate.roomId === roomId,
-    );
+  if (!roomId || !participantId) {
+    return Response.json({ messages: [] }, { status: 404 });
+  }
 
-    if (!participant) return Response.json({ messages: [] }, { status: 404 });
+  const { messages, isRoomEmpty } = await withRoom(roomId, (room) => {
+    room.participants = pruneExpired(room.participants);
+    const participant = room.participants.find((candidate) => candidate.id === participantId);
+    if (!participant) {
+      return { messages: null, isRoomEmpty: room.participants.length === 0 };
+    }
 
     participant.lastSeen = Date.now();
-    const messages = participant.messages.splice(0, participant.messages.length);
-    return Response.json({ messages });
+    const drained = participant.messages.splice(0, participant.messages.length);
+    return { messages: drained, isRoomEmpty: false };
   });
+
+  // The participant expired (or the room emptied out) without a graceful
+  // 'bye' — reconcile the matchmaking index so the slot isn't stuck "full".
+  if (isRoomEmpty) void releaseRoomFromIndex(roomId);
+
+  if (messages === null) return Response.json({ messages: [] }, { status: 404 });
+  return Response.json({ messages });
 }
