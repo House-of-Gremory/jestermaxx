@@ -60,6 +60,11 @@ export default function IntroBuilder() {
     if (stage !== 'capture') return;
     let cancelled = false;
 
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setCameraError('Camera access is required to build your intro reel — allow it and try again.');
+      return;
+    }
+
     navigator.mediaDevices
       .getUserMedia({ video: true })
       .then((stream) => {
