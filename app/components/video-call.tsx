@@ -3,6 +3,7 @@
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
 import { type FormEvent, useCallback, useEffect, useRef, useState } from 'react';
+import { VoiceFilter } from '../lib/audio/voice-filter';
 import { useLaughDetector } from '../lib/laugh/use-laugh-detector';
 import type { ExpressionLabel, LaughEvent, ScoreReason } from '../lib/laugh/types';
 
@@ -242,7 +243,14 @@ export default function VideoCall() {
   const sessionEpochRef = useRef(0);
   // Gift attack: one send per player per match. `giftOpen` toggles the paste bar,
   // `incomingGift` is the shortcode to embed (set only on the RECEIVING side).
-  const [giftUsed, setGiftUsed] = useState(false);
+  // Kept (and still reset per match) so the one-gift-per-match limit can be
+  // restored by re-adding the guard in sendGift and the disabled state below.
+  const [, setGiftUsed] = useState(false);
+  // Chipmunk voice filter: pitch-shifts the audio we SEND, so only the opponent
+  // hears it. `chipmunkBusy` guards the async worklet setup from double-clicks.
+  const [chipmunkOn, setChipmunkOn] = useState(false);
+  const [chipmunkBusy, setChipmunkBusy] = useState(false);
+  const voiceFilterRef = useRef<VoiceFilter | null>(null);
   const [giftOpen, setGiftOpen] = useState(false);
   const [giftInput, setGiftInput] = useState('');
   const [giftError, setGiftError] = useState<string | null>(null);
@@ -775,6 +783,10 @@ export default function VideoCall() {
       setGiftError(null);
       setIncomingGift(null);
       setGiftCloseIn(0);
+      // The old peer connection is gone, so any active filter is stale.
+      voiceFilterRef.current?.stop();
+      voiceFilterRef.current = null;
+      setChipmunkOn(false);
       setOpponentIntroRecord(null);
       setIntroHasPlayed(false);
       try {
@@ -907,6 +919,8 @@ export default function VideoCall() {
       localStreamRef.current = null;
       sendLaughRef.current = null;
       sendGiftRef.current = null;
+      voiceFilterRef.current?.stop();
+      voiceFilterRef.current = null;
       sendMatchEndRef.current = null;
       sendForfeitRef.current = null;
       clearInterval(scoreSyncTimer);
@@ -946,10 +960,54 @@ export default function VideoCall() {
   // Leave the current opponent and immediately look for a different one. The
   // room being left is excluded from the next match so you don't get rematched
   // with the same person.
-  // Spend this player's single gift: validate the pasted Instagram link and
-  // relay only the shortcode, so the post renders on the opponent's screen.
+  // Swaps the outgoing audio between the raw mic and the pitch-shifted version.
+  // replaceTrack() changes what the peer receives without renegotiating, and it
+  // only touches the SENDER — our own laugh detector keeps reading the raw mic
+  // stream, so scoring is unaffected by the effect.
+  async function toggleChipmunk() {
+    if (chipmunkBusy) return;
+    const sender = peerConnectionRef.current
+      ?.getSenders()
+      .find((candidate) => candidate.track?.kind === 'audio');
+    const micTrack = localStreamRef.current?.getAudioTracks()[0];
+    if (!sender || !micTrack) return;
+
+    setChipmunkBusy(true);
+    try {
+      if (chipmunkOn) {
+        await sender.replaceTrack(micTrack);
+        voiceFilterRef.current?.stop();
+        voiceFilterRef.current = null;
+        setChipmunkOn(false);
+        return;
+      }
+
+      const filter = new VoiceFilter();
+      const processed = await filter.start(localStreamRef.current as MediaStream);
+      if (!processed) {
+        filter.stop();
+        return;
+      }
+      await sender.replaceTrack(processed);
+      voiceFilterRef.current = filter;
+      setChipmunkOn(true);
+    } catch (error) {
+      console.error('Chipmunk filter failed', error);
+      // Make sure a half-built graph never keeps running.
+      voiceFilterRef.current?.stop();
+      voiceFilterRef.current = null;
+      setChipmunkOn(false);
+    } finally {
+      setChipmunkBusy(false);
+    }
+  }
+
+  // Validate the pasted link and relay only the parsed descriptor, so the media
+  // renders on the opponent's screen.
+  // NOTE: the one-per-match limit is temporarily lifted for testing — sends are
+  // unlimited. Restore it by re-adding the giftUsed guard and setGiftUsed(true).
   function sendGift() {
-    if (giftUsed || !connected) return;
+    if (!connected) return;
 
     const gift = parseGiftMedia(giftInput);
     if (!gift) {
@@ -958,7 +1016,6 @@ export default function VideoCall() {
     }
 
     sendGiftRef.current?.(gift);
-    setGiftUsed(true);
     setGiftOpen(false);
     setGiftInput('');
     setGiftError(null);
@@ -1131,8 +1188,8 @@ export default function VideoCall() {
               🔒 Audio is analyzed on your device to detect laughs — never recorded or uploaded.
             </p>
 
-            {/* Gift attack: one send per player. Opening reveals the paste bar. */}
-            {giftOpen && !giftUsed && (
+            {/* Gift attack. Opening reveals the paste bar. */}
+            {giftOpen && (
               <div className="mx-auto mt-4 w-full max-w-md">
                 <div className="flex gap-2">
                   <input
@@ -1162,15 +1219,23 @@ export default function VideoCall() {
             <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
               <button
                 onClick={() => setGiftOpen((open) => !open)}
-                disabled={giftUsed || !connected}
-                title={
-                  giftUsed
-                    ? 'You have already sent your gift this match'
-                    : 'One gift per player — it plays on your opponent’s screen'
-                }
+                disabled={!connected}
+                title="Plays on your opponent’s screen"
                 className="rounded-xl border border-fuchsia-400/50 bg-fuchsia-500/10 px-6 py-3 text-sm font-black uppercase tracking-widest text-fuchsia-300 transition hover:bg-fuchsia-500/20 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/5 disabled:text-white/30"
               >
-                {giftUsed ? '🎁 Gift sent' : giftOpen ? '🎁 Cancel' : '🎁 Send gift'}
+                {giftOpen ? '🎁 Cancel' : '🎁 Send gift'}
+              </button>
+              <button
+                onClick={toggleChipmunk}
+                disabled={!connected || chipmunkBusy}
+                title="Pitch-shifts your voice for your opponent"
+                className={`rounded-xl border px-6 py-3 text-sm font-black uppercase tracking-widest transition disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/5 disabled:text-white/30 ${
+                  chipmunkOn
+                    ? 'border-amber-400 bg-amber-400 text-black hover:bg-amber-300'
+                    : 'border-amber-400/50 bg-amber-400/10 text-amber-300 hover:bg-amber-400/20'
+                }`}
+              >
+                {chipmunkOn ? '🐿 Chipmunk on' : '🐿 Chipmunk'}
               </button>
               <button
                 onClick={nextPlayer}
@@ -1216,17 +1281,7 @@ export default function VideoCall() {
               )}
             </div>
             {/* muted + playsInline is what makes autoplay actually permitted. */}
-            {incomingGift.kind === 'video' && (
-              <video
-                src={incomingGift.url}
-                autoPlay
-                muted
-                loop
-                playsInline
-                controls
-                className="max-h-[60vh] w-full bg-black"
-              />
-            )}
+            {incomingGift.kind === 'video' && <GiftVideo url={incomingGift.url} />}
 
             {incomingGift.kind === 'image' && (
               // Arbitrary remote host chosen at runtime, so next/image (which
@@ -1239,16 +1294,7 @@ export default function VideoCall() {
               />
             )}
 
-            {incomingGift.kind === 'youtube' && (
-              <iframe
-                // Built from a validated 11-char video id only.
-                src={`https://www.youtube-nocookie.com/embed/${incomingGift.id}?autoplay=1&mute=1&playsinline=1`}
-                title="Gift from your opponent"
-                className="aspect-video w-full border-0 bg-black"
-                allow="autoplay; encrypted-media; picture-in-picture"
-                allowFullScreen
-              />
-            )}
+            {incomingGift.kind === 'youtube' && <GiftYouTube id={incomingGift.id} />}
 
             {incomingGift.kind === 'instagram' && (
               // Instagram's player is inside a cross-origin iframe, so playback
@@ -1304,6 +1350,71 @@ export default function VideoCall() {
         </div>
       )}
     </main>
+  );
+}
+
+// Browsers only ever guarantee MUTED autoplay — an audible autoplay is blocked
+// unless the browser considers the page "activated" by the user. So both gift
+// players start muted (which always plays) and then immediately try to unmute.
+// The receiver has clicked through the arena and granted camera/mic, so that
+// usually succeeds; when it doesn't, playback simply stays muted rather than
+// stalling. There is no way to force audible autoplay in every browser.
+function GiftVideo({ url }: { url: string }) {
+  const unmuteTriedRef = useRef(false);
+
+  return (
+    <video
+      src={url}
+      autoPlay
+      muted
+      loop
+      playsInline
+      controls
+      className="max-h-[60vh] w-full bg-black"
+      onPlaying={(event) => {
+        if (unmuteTriedRef.current) return;
+        unmuteTriedRef.current = true;
+
+        const video = event.currentTarget;
+        video.muted = false;
+        video.volume = 1;
+        // Unmuting can make the browser pause playback; if so, fall back to
+        // muted-but-playing, which is better than a frozen frame.
+        void video.play().catch(() => {
+          video.muted = true;
+          void video.play().catch(() => {});
+        });
+      }}
+    />
+  );
+}
+
+function GiftYouTube({ id }: { id: string }) {
+  const frameRef = useRef<HTMLIFrameElement>(null);
+  const ORIGIN = 'https://www.youtube-nocookie.com';
+
+  return (
+    <iframe
+      ref={frameRef}
+      // Built from a validated 11-char video id only. enablejsapi lets us send
+      // the unMute command below once the player has actually started.
+      src={`${ORIGIN}/embed/${id}?autoplay=1&mute=1&playsinline=1&enablejsapi=1`}
+      title="Gift from your opponent"
+      className="aspect-video w-full border-0 bg-black"
+      allow="autoplay; encrypted-media; picture-in-picture"
+      allowFullScreen
+      onLoad={() => {
+        const frame = frameRef.current?.contentWindow;
+        if (!frame) return;
+        const send = (func: string, args: unknown[] = []) =>
+          frame.postMessage(JSON.stringify({ event: 'command', func, args }), ORIGIN);
+        // Give the player a moment to initialise before commanding it.
+        setTimeout(() => {
+          send('unMute');
+          send('setVolume', [100]);
+        }, 600);
+      }}
+    />
   );
 }
 

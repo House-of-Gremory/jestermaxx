@@ -30,13 +30,17 @@ const SMILE_OFF = 0.28; // must drop below this...
 const SMILE_CLEAR_MS = 2000; // ...for this long before smiling turns OFF
 const SMILE_POINTS = 0.5;
 
-// Laugh confirmation.
-const SMILE_PEAK_MIN = 0.45;
-const JAW_CUE = 0.18;
-const SQUINT_CUE = 0.22;
+// Laugh confirmation. A real laugh shows SEVERAL things at once — an open jaw,
+// cheek/eye squint, and audible rhythmic bursts — whereas a plain smile or a
+// stray noise shows at most one. Requiring two independent cues (rather than
+// any single one) is what separates laughter from both.
+const SMILE_PEAK_MIN = 0.5;
+const JAW_CUE = 0.22;
+const SQUINT_CUE = 0.25;
 const BURST_CUE = 2;
+const MIN_CUES = 2; // how many of {jaw, squint, audio bursts} must be present
 const MIN_FACE_PRESENCE = 0.5;
-const CONFIRM_CONFIDENCE = 0.45;
+const CONFIRM_CONFIDENCE = 0.52;
 const LAUGH_POINTS = 1;
 
 type State = 'QUIET' | 'POSSIBLE';
@@ -220,8 +224,12 @@ export class LaughDetector {
 
     const facePresence = this.faceWindows / Math.max(1, this.totalWindows);
     const avgCombined = this.combinedSum / Math.max(1, this.totalWindows);
-    const hasCue =
-      this.jawPeak >= JAW_CUE || this.squintPeak >= SQUINT_CUE || this.bursts >= BURST_CUE;
+    // Count independent corroborating cues instead of accepting any single one.
+    const cueCount =
+      (this.jawPeak >= JAW_CUE ? 1 : 0) +
+      (this.squintPeak >= SQUINT_CUE ? 1 : 0) +
+      (this.bursts >= BURST_CUE ? 1 : 0);
+    const hasCue = cueCount >= MIN_CUES;
     const confirmed =
       duration >= CANDIDATE_MIN_MS &&
       duration <= CANDIDATE_MAX_MS &&
