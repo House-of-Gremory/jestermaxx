@@ -10,8 +10,8 @@ const STEPS = [
   {
     n: '2',
     emoji: '🃏',
-    title: 'SOLO JESTER SCAN',
-    body: 'Take a Solo Jester Scan to verify you mog.',
+    title: 'Jester maxxing rule',
+    body: 'Make your opponent giggle',
   },
   {
     n: '3',
