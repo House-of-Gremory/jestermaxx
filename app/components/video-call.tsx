@@ -149,7 +149,12 @@ function parseGiftMedia(input: string): GiftMedia | null {
 // last synced value (their clock may hit zero slightly after ours).
 const MATCH_END_GRACE_MS = 2500;
 
-const FALLBACK_ICE_SERVERS: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }];
+const FALLBACK_ICE_SERVERS: RTCIceServer[] = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun2.l.google.com:19302' },
+  { urls: 'stun:stun.cloudflare.com:3478' },
+];
 
 // How often the client polls for signaling messages. Lower = faster handshake
 // (and faster ghost cleanup, since each poll refreshes lastSeen) at the cost of

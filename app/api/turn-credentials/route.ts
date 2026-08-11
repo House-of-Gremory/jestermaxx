@@ -3,7 +3,12 @@ import { withDatabase } from '@/lib/db';
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
 
-const FALLBACK_ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }];
+const FALLBACK_ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun2.l.google.com:19302' },
+  { urls: 'stun:stun.cloudflare.com:3478' },
+];
 
 type IceServerEntry = { urls: string | string[]; username?: string; credential?: string };
 type PoolEntry = { entry: IceServerEntry; latencyMs: number | null };
