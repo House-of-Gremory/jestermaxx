@@ -2,6 +2,17 @@ import { createHmac, randomBytes, scryptSync, timingSafeEqual } from 'node:crypt
 
 export const USER_SESSION_COOKIE = 'user_session';
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+export const USER_SESSION_MAX_AGE_SECONDS = 30 * 24 * 60 * 60;
+
+// Shared cookie flags, matching the admin session. `secure` is conditional so
+// the cookie still works on plain-http localhost during development, but is
+// never sent over an unencrypted connection in production.
+export const userSessionCookieOptions = {
+  httpOnly: true,
+  secure: process.env.NODE_ENV === 'production',
+  sameSite: 'lax' as const,
+  path: '/',
+};
 
 // --- password hashing (scrypt, per-user random salt) -------------------------
 

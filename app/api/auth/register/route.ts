@@ -1,5 +1,12 @@
+import { NextResponse } from 'next/server';
 import { withDatabase, type UserRecord } from '@/lib/db';
-import { createUserSessionToken, hashPassword, USER_SESSION_COOKIE } from '@/lib/user-auth';
+import {
+  createUserSessionToken,
+  hashPassword,
+  USER_SESSION_COOKIE,
+  USER_SESSION_MAX_AGE_SECONDS,
+  userSessionCookieOptions,
+} from '@/lib/user-auth';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
@@ -55,19 +62,16 @@ export async function POST(request: Request) {
 
   if ('error' in result) return Response.json({ error: result.error }, { status: 409 });
 
-  const token = createUserSessionToken(result.user.id);
-  return Response.json(
-    {
-      user: {
-        username: result.user.username,
-        email: result.user.email,
-        verified: result.user.verified,
-      },
+  const response = NextResponse.json({
+    user: {
+      username: result.user.username,
+      email: result.user.email,
+      verified: result.user.verified,
     },
-    {
-      headers: {
-        'Set-Cookie': `${USER_SESSION_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${30 * 24 * 60 * 60}`,
-      },
-    },
-  );
+  });
+  response.cookies.set(USER_SESSION_COOKIE, createUserSessionToken(result.user.id), {
+    ...userSessionCookieOptions,
+    maxAge: USER_SESSION_MAX_AGE_SECONDS,
+  });
+  return response;
 }

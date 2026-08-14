@@ -1,5 +1,12 @@
+import { NextResponse } from 'next/server';
 import { withDatabase } from '@/lib/db';
-import { createUserSessionToken, verifyPassword, USER_SESSION_COOKIE } from '@/lib/user-auth';
+import {
+  createUserSessionToken,
+  verifyPassword,
+  USER_SESSION_COOKIE,
+  USER_SESSION_MAX_AGE_SECONDS,
+  userSessionCookieOptions,
+} from '@/lib/user-auth';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
@@ -30,13 +37,12 @@ export async function POST(request: Request) {
     return Response.json({ error: 'Invalid credentials.' }, { status: 401 });
   }
 
-  const token = createUserSessionToken(user.id);
-  return Response.json(
-    { user: { username: user.username, email: user.email, verified: user.verified } },
-    {
-      headers: {
-        'Set-Cookie': `${USER_SESSION_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${30 * 24 * 60 * 60}`,
-      },
-    },
-  );
+  const response = NextResponse.json({
+    user: { username: user.username, email: user.email, verified: user.verified },
+  });
+  response.cookies.set(USER_SESSION_COOKIE, createUserSessionToken(user.id), {
+    ...userSessionCookieOptions,
+    maxAge: USER_SESSION_MAX_AGE_SECONDS,
+  });
+  return response;
 }
