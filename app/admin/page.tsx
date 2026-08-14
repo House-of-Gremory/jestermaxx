@@ -4,6 +4,14 @@ import { useEffect, useState, type FormEvent } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import type { TurnServerRecord, TurnProviderRecord } from '@/lib/db';
+
+type AdminUser = {
+  id: string;
+  username: string;
+  email: string;
+  verified: boolean;
+  createdAt: number;
+};
 import { TURN_PROVIDER_TYPES, type TurnProviderType } from '@/lib/turn-provider-types';
 
 const STATUS_STYLES: Record<TurnServerRecord['status'], string> = {
@@ -37,6 +45,7 @@ export default function AdminTurnServersPage() {
   const [username, setUsername] = useState('');
   const [credential, setCredential] = useState('');
 
+  const [users, setUsers] = useState<AdminUser[] | null>(null);
   const [providers, setProviders] = useState<TurnProviderRecord[] | null>(null);
   const [providerLabel, setProviderLabel] = useState('');
   const [providerType, setProviderType] = useState<TurnProviderType>('xirsys');
@@ -62,6 +71,35 @@ export default function AdminTurnServersPage() {
     const data = (await response.json()) as { providers: TurnProviderRecord[] };
     setProviders(data.providers);
   }
+
+  async function loadUsers() {
+    const response = await fetch('/api/admin/users');
+    if (!response.ok) {
+      setError('Failed to load users');
+      return;
+    }
+    const data = (await response.json()) as { users: AdminUser[] };
+    setUsers(data.users);
+  }
+
+  async function handleSetVerified(id: string, verified: boolean) {
+    setError('');
+    const response = await fetch('/api/admin/users', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, verified }),
+    });
+    if (!response.ok) {
+      setError('Failed to update user');
+      return;
+    }
+    await loadUsers();
+  }
+
+  useEffect(() => {
+    // Users load independently of the TURN pool so one failing doesn't blank the other.
+    void loadUsers();
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -204,6 +242,71 @@ export default function AdminTurnServersPage() {
         {error && (
           <p className="mb-6 rounded-lg bg-red-500/10 px-3 py-2 text-sm text-red-300">{error}</p>
         )}
+
+        <h2 className="mb-3 text-sm uppercase tracking-widest text-white/50">
+          Players ({users?.length ?? 0}) — manual verification
+        </h2>
+        <div className="mb-12 overflow-x-auto rounded-2xl border border-white/10">
+          <table className="w-full text-left text-sm">
+            <thead className="bg-white/5 text-xs uppercase tracking-widest text-white/50">
+              <tr>
+                <th className="px-4 py-3">Username</th>
+                <th className="px-4 py-3">Email</th>
+                <th className="px-4 py-3">Joined</th>
+                <th className="px-4 py-3">Status</th>
+                <th className="px-4 py-3" />
+              </tr>
+            </thead>
+            <tbody>
+              {users === null && (
+                <tr>
+                  <td colSpan={5} className="px-4 py-6 text-center text-white/40">
+                    Loading…
+                  </td>
+                </tr>
+              )}
+              {users?.length === 0 && (
+                <tr>
+                  <td colSpan={5} className="px-4 py-6 text-center text-white/40">
+                    No registered players yet.
+                  </td>
+                </tr>
+              )}
+              {users?.map((user) => (
+                <tr key={user.id} className="border-t border-white/10">
+                  <td className="px-4 py-3 font-bold">{user.username}</td>
+                  <td className="px-4 py-3 text-white/60">{user.email}</td>
+                  <td className="px-4 py-3 text-white/60">
+                    {new Date(user.createdAt).toLocaleDateString()}
+                  </td>
+                  <td className="px-4 py-3">
+                    <span
+                      className={`rounded-full border px-2 py-0.5 text-xs uppercase tracking-widest ${
+                        user.verified
+                          ? 'border-lime-400/30 bg-lime-400/15 text-lime-300'
+                          : 'border-amber-400/30 bg-amber-400/15 text-amber-300'
+                      }`}
+                    >
+                      {user.verified ? 'verified' : 'unverified'}
+                    </span>
+                  </td>
+                  <td className="px-4 py-3">
+                    <button
+                      onClick={() => handleSetVerified(user.id, !user.verified)}
+                      className={`text-xs uppercase tracking-widest ${
+                        user.verified
+                          ? 'text-amber-300/70 hover:text-amber-300'
+                          : 'text-lime-300/70 hover:text-lime-300'
+                      }`}
+                    >
+                      {user.verified ? 'Revoke' : 'Verify'}
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
 
         <h2 className="mb-3 text-sm uppercase tracking-widest text-white/50">Static relay (manual credentials)</h2>
         <form
