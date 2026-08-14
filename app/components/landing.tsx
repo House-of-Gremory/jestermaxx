@@ -1,4 +1,5 @@
 import Link from 'next/link';
+import AuthBanner from './auth-banner';
 
 const STEPS = [
   {
@@ -40,16 +41,8 @@ export default function Landing() {
       <div aria-hidden className="pointer-events-none absolute top-40 -right-24 h-[340px] w-[340px] rounded-full bg-lime-400/20 blur-[120px]" />
 
       <div className="relative mx-auto flex min-h-screen max-w-5xl flex-col px-5 py-6">
-        {/* guest banner */}
-        <div className="mx-auto mb-10 flex w-full max-w-xl items-center justify-between gap-4 rounded-full border border-white/10 bg-white/5 px-4 py-2 text-xs backdrop-blur">
-          <span className="flex items-center gap-2 text-white/70">
-            <span className="text-base">👻</span>
-            Playing as a <span className="text-white">Guest</span>. Claim your rank.
-          </span>
-          <button className="rounded-full bg-lime-400 px-4 py-1.5 font-bold uppercase tracking-widest text-black transition hover:bg-lime-300">
-            Claim
-          </button>
-        </div>
+        {/* auth banner: login/signup for guests, account + verified state otherwise */}
+        <AuthBanner />
 
         {/* hero */}
         <section className="flex flex-col items-center text-center">

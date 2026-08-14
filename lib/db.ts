@@ -72,7 +72,18 @@ export type TurnProviderRecord = {
   lastError: string | null;
 };
 
-// Admin/config data only (intros, TURN servers/providers) — low-frequency,
+export type UserRecord = {
+  id: string;
+  username: string;
+  email: string;
+  // scrypt hash as "saltHex:hashHex" — never the raw password.
+  passwordHash: string;
+  // Manually flipped from the admin panel for now; automated verification later.
+  verified: boolean;
+  createdAt: number;
+};
+
+// Admin/config data only (intros, TURN servers/providers, users) — low-frequency,
 // shared under one key/lock. Room matchmaking and signaling messages live in
 // their own stores below so the 400ms polling hot path never contends with
 // this or with other rooms (see withRoomIndex/withRoom).
@@ -80,6 +91,7 @@ export type Database = {
   intros: IntroRecord[];
   turnServers: TurnServerRecord[];
   turnProviders: TurnProviderRecord[];
+  users: UserRecord[];
 };
 
 const redis =
@@ -122,6 +134,7 @@ const localStore: Database = (globalStore.__jesterDb ??= {
   intros: [],
   turnServers: [],
   turnProviders: [],
+  users: [],
 });
 const localRooms: RoomRecord[] = (globalStore.__jesterRooms ??= []);
 const localRoomData: Map<string, LocalRoom> = (globalStore.__jesterRoomData ??= new Map());
@@ -184,6 +197,7 @@ export async function withDatabase<T>(
     localStore.intros ??= [];
     localStore.turnServers ??= [];
     localStore.turnProviders ??= [];
+    localStore.users ??= [];
     return operation({ data: localStore });
   }
 
@@ -193,10 +207,12 @@ export async function withDatabase<T>(
       intros: [],
       turnServers: [],
       turnProviders: [],
+      users: [],
     };
     data.intros ??= [];
     data.turnServers ??= [];
     data.turnProviders ??= [];
+    data.users ??= [];
     const result = await operation({ data });
     await redis.set(REDIS_DATA_KEY, data, { ex: 60 * 60 });
     return result;
