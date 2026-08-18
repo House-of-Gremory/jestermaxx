@@ -22,6 +22,9 @@ export default function IntroBuilder() {
   const [usernameInput, setUsernameInput] = useState('');
   const [username, setUsername] = useState(queryUsername);
   const [stage, setStage] = useState<Stage>(queryUsername ? 'capture' : 'name');
+  // Withholds the name stage until the session check finishes (skipped when a
+  // username was passed in, since then there is nothing to decide).
+  const [checkingAccount, setCheckingAccount] = useState(!queryUsername);
 
   const [slots, setSlots] = useState<(BuilderSlide | null)[]>(EMPTY_SLOTS);
   const [styleIndex, setStyleIndex] = useState(0);
@@ -37,14 +40,39 @@ export default function IntroBuilder() {
   const styleImageRef = useRef<HTMLDivElement>(null);
   const draggingRef = useRef(false);
 
-  // Prefill a previously saved name only when this page wasn't linked to
-  // directly with a username already known (e.g. from the /arena gate).
+  // A signed-in player already has a name, so the name stage is skipped
+  // entirely — letting them retype it here would defeat the point of the
+  // account. Guests keep the old behaviour: the last name they used is
+  // prefilled into the form. Skipped when the page was linked to with a
+  // username already known (e.g. from the /arena gate).
   useEffect(() => {
     if (queryUsername) return;
-    const saved = loadSavedUsername();
-    if (!saved) return;
-    const timer = setTimeout(() => setUsernameInput(saved), 0);
-    return () => clearTimeout(timer);
+    let cancelled = false;
+    void (async () => {
+      try {
+        const response = await fetch('/api/auth/me', { cache: 'no-store' });
+        const data = (await response.json()) as { user: { username: string } | null };
+        if (cancelled) return;
+
+        const accountName = data.user?.username;
+        if (accountName) {
+          saveUsername(accountName);
+          setUsername(accountName);
+          setStage('capture');
+          return;
+        }
+        const saved = loadSavedUsername();
+        if (saved) setUsernameInput(saved);
+      } catch {
+        const saved = loadSavedUsername();
+        if (!cancelled && saved) setUsernameInput(saved);
+      } finally {
+        if (!cancelled) setCheckingAccount(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [queryUsername]);
 
   function stopCamera() {
@@ -230,7 +258,7 @@ export default function IntroBuilder() {
           <span className="w-16" />
         </header>
 
-        {stage === 'name' && (
+        {stage === 'name' && !checkingAccount && (
           <section className="flex flex-1 flex-col items-center justify-center">
             <form
               onSubmit={submitName}
