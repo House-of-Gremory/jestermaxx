@@ -236,6 +236,8 @@ export default function VideoCall() {
   // The opponent's intro reel, played in the opponent tile in place of a
   // loading screen until the real remote video connects. Never our own.
   const [opponentIntroRecord, setOpponentIntroRecord] = useState<IntroRecordResolved | null>(null);
+  // Shown on the opponent tile once matchmaking tells us who they are.
+  const [opponentName, setOpponentName] = useState('');
   // Whether that reel has played all the way through at least once. The
   // switch to real video waits on this too, so a fast connection never cuts
   // the intro off mid-loop.
@@ -246,6 +248,10 @@ export default function VideoCall() {
   // Incremented on every (re)connect so async work started for an earlier match
   // can detect that it is stale and drop its result instead of applying it.
   const sessionEpochRef = useRef(0);
+  // While true the name form is withheld, so a signed-in player never sees it
+  // flash before auto-entry kicks in.
+  const [checkingAccount, setCheckingAccount] = useState(true);
+  const autoEnteredRef = useRef(false);
   // Gift attack: one send per player per match. `giftOpen` toggles the paste bar,
   // `incomingGift` is the shortcode to embed (set only on the RECEIVING side).
   // Kept (and still reset per match) so the one-gift-per-match limit can be
@@ -334,15 +340,6 @@ export default function VideoCall() {
     enabled: connected,
     onLaugh: handleLocalLaugh,
   });
-
-  // Prefill the previously saved name on first load (deferred so it isn't a
-  // synchronous setState in the effect body, and avoids a hydration mismatch).
-  useEffect(() => {
-    const saved = loadSavedUsername();
-    if (!saved) return;
-    const timer = setTimeout(() => setUsernameInput(saved), 0);
-    return () => clearTimeout(timer);
-  }, []);
 
   // Counts the gift lock down to zero, at which point the close button appears.
   // The initial value is set when the gift arrives, so nothing is set here
@@ -704,6 +701,7 @@ export default function VideoCall() {
         // The first person in every room is the caller. When the second person
         // joins, only that first person receives this event and creates offer.
         setStatus('Opponent found. Connecting…');
+        setOpponentName(message.payload.username);
         void loadOpponentIntro(message.payload.username);
         await createOffer();
       } else if (message.type === 'offer') {
@@ -793,6 +791,7 @@ export default function VideoCall() {
       voiceFilterRef.current = null;
       setChipmunkOn(false);
       setOpponentIntroRecord(null);
+      setOpponentName('');
       setIntroHasPlayed(false);
       try {
         setStatus('Finding an opponent…');
@@ -821,7 +820,10 @@ export default function VideoCall() {
         };
         roomIdRef.current = joinData.roomId;
         participantIdRef.current = joinData.participantId;
-        if (joinData.opponentUsername) void loadOpponentIntro(joinData.opponentUsername);
+        if (joinData.opponentUsername) {
+          setOpponentName(joinData.opponentUsername);
+          void loadOpponentIntro(joinData.opponentUsername);
+        }
 
         setStatus('Requesting camera and microphone…');
         // On Windows a single physical webcam is often locked by the first tab,
@@ -945,9 +947,14 @@ export default function VideoCall() {
   // yet, send the player to build one and come straight back here after.
   async function joinCall(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const name = usernameInput.trim().slice(0, 32);
+    await enterArena(usernameInput);
+  }
+
+  // Shared by the manual form and the signed-in auto-entry below.
+  async function enterArena(rawName: string) {
+    const name = rawName.trim().slice(0, 32);
     if (!name) return;
-    saveUsername(name); // remember for next visit until a real DB exists
+    saveUsername(name); // keeps the intro builder and a signed-out revisit in sync
 
     // Only gates entry — the fetched record itself is never shown, since we
     // only ever display the opponent's intro reel, never our own.
@@ -961,6 +968,44 @@ export default function VideoCall() {
 
     setUsername(name);
   }
+
+  // A signed-in player should never retype their name: read the account from
+  // the session and go straight in. Guests keep the old behaviour — the last
+  // name they used is prefilled into the form. All state is set after an await,
+  // so nothing is assigned synchronously in the effect body.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const response = await fetch('/api/auth/me', { cache: 'no-store' });
+        const data = (await response.json()) as { user: { username: string } | null };
+        if (cancelled) return;
+
+        const accountName = data.user?.username;
+        if (accountName && !autoEnteredRef.current) {
+          autoEnteredRef.current = true;
+          setUsernameInput(accountName);
+          await enterArena(accountName);
+          return;
+        }
+        if (!accountName) {
+          const saved = loadSavedUsername();
+          if (saved) setUsernameInput(saved);
+        }
+      } catch {
+        const saved = loadSavedUsername();
+        if (!cancelled && saved) setUsernameInput(saved);
+      } finally {
+        if (!cancelled) setCheckingAccount(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // enterArena is a stable declaration in this component; re-running on every
+    // render would re-enter the arena in a loop.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Leave the current opponent and immediately look for a different one. The
   // room being left is excluded from the next match so you don't get rematched
@@ -1078,7 +1123,11 @@ export default function VideoCall() {
           <span className="w-16" />
         </header>
 
-        {!username ? (
+        {!username && checkingAccount ? (
+          <section className="flex flex-1 flex-col items-center justify-center">
+            <p className="text-sm uppercase tracking-[0.3em] text-white/40">Loading…</p>
+          </section>
+        ) : !username ? (
           <section className="flex flex-1 flex-col items-center justify-center">
             <form
               onSubmit={joinCall}
@@ -1157,7 +1206,7 @@ export default function VideoCall() {
             {/* Side-by-side video tiles (stack on small screens) */}
             <div className="grid flex-1 gap-4 md:grid-cols-2">
               <VideoTile
-                label="You"
+                label={username || 'You'}
                 mirrored
                 muted
                 videoRef={localVideoRef}
@@ -1172,7 +1221,7 @@ export default function VideoCall() {
                 }
               />
               <VideoTile
-                label="Opponent"
+                label={opponentName || 'Opponent'}
                 videoRef={remoteVideoRef}
                 placeholder={!connected}
                 overlay={

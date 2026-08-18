@@ -96,6 +96,28 @@ export default function AdminTurnServersPage() {
     await loadUsers();
   }
 
+  async function handleDeleteUser(id: string, username: string) {
+    // Irreversible, and it removes their intro reel too — make it deliberate.
+    if (
+      !window.confirm(
+        `Delete "${username}"? This also removes their intro reel and cannot be undone.`,
+      )
+    ) {
+      return;
+    }
+    setError('');
+    const response = await fetch('/api/admin/users', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id }),
+    });
+    if (!response.ok) {
+      setError('Failed to delete user');
+      return;
+    }
+    await loadUsers();
+  }
+
   useEffect(() => {
     // Users load independently of the TURN pool so one failing doesn't blank the other.
     void loadUsers();
@@ -300,6 +322,12 @@ export default function AdminTurnServersPage() {
                       }`}
                     >
                       {user.verified ? 'Revoke' : 'Verify'}
+                    </button>
+                    <button
+                      onClick={() => handleDeleteUser(user.id, user.username)}
+                      className="ml-4 text-xs uppercase tracking-widest text-red-300/70 hover:text-red-300"
+                    >
+                      Delete
                     </button>
                   </td>
                 </tr>
