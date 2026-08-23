@@ -251,6 +251,9 @@ export default function VideoCall() {
   // While true the name form is withheld, so a signed-in player never sees it
   // flash before auto-entry kicks in.
   const [checkingAccount, setCheckingAccount] = useState(true);
+  // Non-empty when a signed-in account drove entry, so leaving the call knows
+  // there is no name to ask for.
+  const [signedInAs, setSignedInAs] = useState('');
   const autoEnteredRef = useRef(false);
   // Gift attack: one send per player per match. `giftOpen` toggles the paste bar,
   // `incomingGift` is the shortcode to embed (set only on the RECEIVING side).
@@ -982,6 +985,7 @@ export default function VideoCall() {
         if (cancelled) return;
 
         const accountName = data.user?.username;
+        setSignedInAs(accountName ?? '');
         if (accountName && !autoEnteredRef.current) {
           autoEnteredRef.current = true;
           setUsernameInput(accountName);
@@ -1095,10 +1099,19 @@ export default function VideoCall() {
     }
     excludeRoomIdRef.current = null;
     setStatus('');
-    setUsername('');
     setMatchResult(null);
     setOpponentIntroRecord(null);
     setIntroHasPlayed(false);
+
+    // A signed-in player has no name to re-enter, and the auto-entry effect
+    // only runs on mount — clearing `username` here would strand them on the
+    // guest name form. Send them back to the landing page instead; unmounting
+    // tears the call down through the connection effect's cleanup.
+    if (signedInAs) {
+      router.push('/');
+      return;
+    }
+    setUsername('');
   }
 
   // From the result screen: clear it and immediately queue a fresh opponent.
