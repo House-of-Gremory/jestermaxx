@@ -1,4 +1,5 @@
 import { withDatabase } from '@/lib/db';
+import { fetchCloudflareTurn } from '@/lib/turn-providers';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
@@ -40,13 +41,32 @@ async function getPool(): Promise<PoolEntry[]> {
   return [...fromServers, ...fromProviders];
 }
 
+async function getCloudflareEnvCredentials(): Promise<IceServerEntry[]> {
+  const turnTokenId = process.env.CLOUDFLARE_TURN_TOKEN_ID;
+  const apiToken = process.env.CLOUDFLARE_TURN_API_TOKEN;
+  if (!turnTokenId || !apiToken) return [];
+
+  try {
+    const credentials = await fetchCloudflareTurn({
+      turnTokenId,
+      apiToken,
+      ttlSeconds: process.env.CLOUDFLARE_TURN_TTL_SECONDS ?? '86400',
+    });
+    return [{ urls: credentials.urls, username: credentials.username, credential: credentials.credential }];
+  } catch (error) {
+    console.error('Failed to fetch Cloudflare TURN credentials', error);
+    return [];
+  }
+}
+
 export async function GET() {
   // The admin-managed pool is the only credentialed source now. Public STUN
   // is appended as a last resort so the list is never empty (no relay, but
   // keeps direct/host candidates working).
   const pool = await getPool();
   pool.sort((a, b) => (a.latencyMs ?? Infinity) - (b.latencyMs ?? Infinity));
-  const iceServers = [...pool.map((item) => item.entry), ...FALLBACK_ICE_SERVERS];
+  const cloudflare = await getCloudflareEnvCredentials();
+  const iceServers = [...pool.map((item) => item.entry), ...cloudflare, ...FALLBACK_ICE_SERVERS];
 
   return Response.json({ iceServers });
 }

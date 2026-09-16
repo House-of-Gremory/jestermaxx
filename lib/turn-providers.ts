@@ -73,9 +73,61 @@ async function fetchMetered(config: Record<string, string>): Promise<ResolvedTur
   };
 }
 
+function withoutBrowserBlockedUrls(urls: string[]): string[] {
+  // Browsers block TURN on port 53, so keep trickle ICE from wasting time there.
+  return urls.filter((url) => !/:53(?:\?|$)/.test(url));
+}
+
+export async function fetchCloudflareTurn(
+  config: Record<string, string>,
+): Promise<ResolvedTurnCredentials> {
+  const turnTokenId = config.turnTokenId?.trim();
+  const apiToken = config.apiToken?.trim();
+  const ttlSeconds = Number(config.ttlSeconds ?? 86_400);
+  if (!turnTokenId || !apiToken) throw new Error('Cloudflare requires turnTokenId and apiToken');
+  if (!Number.isFinite(ttlSeconds) || ttlSeconds <= 0) {
+    throw new Error('Cloudflare ttlSeconds must be a positive number');
+  }
+
+  const response = await fetch(
+    `https://rtc.live.cloudflare.com/v1/turn/keys/${encodeURIComponent(turnTokenId)}/credentials/generate-ice-servers`,
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ ttl: ttlSeconds }),
+      cache: 'no-store',
+    },
+  );
+  if (!response.ok) throw new Error(`Cloudflare TURN request failed: HTTP ${response.status}`);
+
+  const data = (await response.json()) as {
+    iceServers?: { urls: string | string[]; username?: string; credential?: string }[];
+  };
+  const turnEntry = data.iceServers?.find((entry) => entry.username && entry.credential);
+  if (!turnEntry?.username || !turnEntry.credential) {
+    throw new Error('Cloudflare returned no TURN credentials');
+  }
+
+  const urls = withoutBrowserBlockedUrls(
+    Array.isArray(turnEntry.urls) ? turnEntry.urls : [turnEntry.urls],
+  );
+  if (urls.length === 0) throw new Error('Cloudflare returned no browser-usable TURN URLs');
+
+  return {
+    urls,
+    username: turnEntry.username,
+    credential: turnEntry.credential,
+    expiresAt: Date.now() + ttlSeconds * 1000,
+  };
+}
+
 const FETCHERS: Record<TurnProviderType, (config: Record<string, string>) => Promise<ResolvedTurnCredentials>> = {
   xirsys: fetchXirsys,
   metered: fetchMetered,
+  cloudflare: fetchCloudflareTurn,
 };
 
 export async function resolveTurnProvider(
