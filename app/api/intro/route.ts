@@ -16,8 +16,34 @@ function resolveIntro(record: IntroRecord): IntroRecordResolved {
   return {
     ...record,
     transitionId: record.transitionId as TransitionId,
-    slides: record.slides.map((slide) => ({ ...slide, url: introImageUrl(slide.imagePath) })),
+    slides: record.slides.map((slide) => ({
+      ...slide,
+      url: slide.imagePath ? introImageUrl(slide.imagePath) : '',
+    })),
   };
+}
+
+// Uploads pending base64 images to R2 on-demand when another player requests
+// this intro. Returns the updated record with R2 URLs.
+async function uploadPendingImages(record: IntroRecord): Promise<IntroRecord> {
+  const hasPending = record.slides.some((s) => s.pendingDataUrl && !s.imagePath);
+  if (!hasPending) return record;
+
+  const updatedSlides = await Promise.all(
+    record.slides.map(async (slide, index) => {
+      if (slide.imagePath || !slide.pendingDataUrl) return slide;
+      const imagePath = await saveIntroImage(record.username, index, slide.pendingDataUrl);
+      return { ...slide, imagePath, pendingDataUrl: undefined };
+    }),
+  );
+
+  const updated = { ...record, slides: updatedSlides };
+  await withDatabase((database) => {
+    const idx = database.data.intros.findIndex((i) => i.username === record.username);
+    if (idx !== -1) database.data.intros[idx] = updated;
+  });
+
+  return updated;
 }
 
 function clampPct(value: unknown, fallback: number): number {
@@ -44,14 +70,16 @@ export async function POST(request: Request) {
 
   let slides: IntroSlide[];
   try {
-    slides = await Promise.all(
-      body.slides.map(async (slide, index) => ({
-        imagePath: await saveIntroImage(username, index, slide.dataUrl!),
-        text: (slide.text ?? '').slice(0, 80),
-        xPct: clampPct(slide.xPct, 50),
-        yPct: clampPct(slide.yPct, 85),
-      })),
-    );
+    // Store images as pending base64 data URLs in the database instead of
+    // uploading to R2 immediately. The upload is deferred until another
+    // player requests this intro (GET /api/intro).
+    slides = body.slides.map((slide, index) => ({
+      imagePath: '',
+      text: (slide.text ?? '').slice(0, 80),
+      xPct: clampPct(slide.xPct, 50),
+      yPct: clampPct(slide.yPct, 85),
+      pendingDataUrl: slide.dataUrl!,
+    }));
   } catch {
     return Response.json({ error: 'Could not save intro images' }, { status: 400 });
   }
@@ -78,9 +106,15 @@ export async function GET(request: Request) {
     return Response.json({ error: 'username is required' }, { status: 400 });
   }
 
-  const record = await withDatabase((database) =>
+  let record = await withDatabase((database) =>
     database.data.intros.find((intro) => intro.username === username),
   );
+
+  // When another player requests this intro, upload pending images to R2
+  // on-demand so they're available via public URL.
+  if (record) {
+    record = await uploadPendingImages(record);
+  }
 
   return Response.json({ intro: record ? resolveIntro(record) : null });
 }

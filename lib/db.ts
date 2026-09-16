@@ -1,4 +1,5 @@
 import { Redis } from '@upstash/redis';
+import { Pool, type PoolClient } from 'pg';
 import type { TurnProviderType } from './turn-provider-types';
 
 export type SignalType = 'peer-joined' | 'offer' | 'answer' | 'candidate' | 'bye';
@@ -26,6 +27,9 @@ export type IntroSlide = {
   text: string;
   xPct: number;
   yPct: number;
+  // Pending base64 image data, stored until another player joins and
+  // triggers the R2 upload. Once uploaded, imagePath is set and this is cleared.
+  pendingDataUrl?: string;
 };
 
 export type IntroRecord = {
@@ -98,6 +102,20 @@ const redis =
   process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN
     ? Redis.fromEnv()
     : null;
+const postgresUrl = process.env.SUPABASE_DATABASE_URL || process.env.DATABASE_URL;
+const globalPg = globalThis as unknown as {
+  __jesterPgPool?: Pool;
+  __jesterPgReady?: Promise<void>;
+  __jesterPgDisabled?: boolean;
+};
+const pgPool =
+  postgresUrl
+    ? (globalPg.__jesterPgPool ??= new Pool({
+        connectionString: postgresUrl,
+        ssl: { rejectUnauthorized: false },
+        max: 6,
+      }))
+    : null;
 const REDIS_DATA_KEY = 'jestermaxing:signaling';
 const REDIS_LOCK_KEY = 'jestermaxing:signaling:lock';
 
@@ -148,11 +166,161 @@ function getLocalRoom(roomId: string): LocalRoom {
   return room;
 }
 
+function emptyDatabase(): Database {
+  return {
+    intros: [],
+    turnServers: [],
+    turnProviders: [],
+    users: [],
+  };
+}
+
+function normalizeDatabase(data: Partial<Database> | null | undefined): Database {
+  return {
+    ...emptyDatabase(),
+    ...data,
+    intros: data?.intros ?? [],
+    turnServers: data?.turnServers ?? [],
+    turnProviders: data?.turnProviders ?? [],
+    users: data?.users ?? [],
+  };
+}
+
+async function ensurePostgresSchema() {
+  if (!pgPool || globalPg.__jesterPgDisabled) return;
+  globalPg.__jesterPgReady ??= (async () => {
+    await pgPool.query(`
+      create table if not exists jester_app_state (
+        key text primary key,
+        data jsonb not null,
+        updated_at timestamptz not null default now()
+      );
+
+      create table if not exists jester_rooms (
+        id text primary key,
+        participant_ids jsonb not null default '[]'::jsonb,
+        created_at bigint not null
+      );
+
+      create table if not exists jester_participants (
+        id text primary key,
+        room_id text not null,
+        username text not null,
+        last_seen bigint not null
+      );
+      create index if not exists jester_participants_room_id_idx on jester_participants(room_id);
+
+      create table if not exists jester_messages (
+        id bigserial primary key,
+        room_id text not null,
+        participant_id text not null,
+        message jsonb not null,
+        created_at timestamptz not null default now()
+      );
+      create index if not exists jester_messages_target_idx
+        on jester_messages(room_id, participant_id, id);
+
+      create table if not exists jester_locks (
+        key text primary key,
+        expires_at bigint not null
+      );
+    `);
+    await pgPool.query(
+      `insert into jester_app_state (key, data)
+       values ('main', $1::jsonb)
+       on conflict (key) do nothing`,
+      [JSON.stringify(emptyDatabase())],
+    );
+    await pgPool.query(
+      `insert into jester_app_state (key, data)
+       values ('room_index_lock', '{}'::jsonb)
+       on conflict (key) do nothing`,
+    );
+  })();
+  await globalPg.__jesterPgReady;
+}
+
+function disablePostgresInDevelopment(error: unknown) {
+  if (process.env.NODE_ENV === 'production') return false;
+  const code = typeof error === 'object' && error && 'code' in error ? String(error.code) : '';
+  if (!['ENETUNREACH', 'EAI_AGAIN', 'ECONNREFUSED', 'ETIMEDOUT'].includes(code)) return false;
+
+  console.warn(
+    `Supabase Postgres is unreachable (${code}); using the local development store until the dev server restarts.`,
+  );
+  globalPg.__jesterPgDisabled = true;
+  globalPg.__jesterPgReady = undefined;
+  void pgPool?.end().catch(() => {});
+  return true;
+}
+
+async function withPostgresClient<T>(operation: (client: PoolClient) => Promise<T>): Promise<T> {
+  if (!pgPool) throw new Error('Postgres is not configured');
+  try {
+    await ensurePostgresSchema();
+    if (globalPg.__jesterPgDisabled) throw new Error('Postgres is disabled');
+    const client = await pgPool.connect();
+    try {
+      return await operation(client);
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    if (disablePostgresInDevelopment(error)) throw new Error('Postgres is disabled');
+    throw error;
+  }
+}
+
+function rowToParticipant(row: {
+  id: string;
+  room_id: string;
+  username: string;
+  last_seen: string | number;
+}): ParticipantRecord {
+  return {
+    id: row.id,
+    roomId: row.room_id,
+    username: row.username,
+    lastSeen: Number(row.last_seen),
+  };
+}
+
+function rowToRoom(row: {
+  id: string;
+  participant_ids: string[] | string;
+  created_at: string | number;
+}): RoomRecord {
+  return {
+    id: row.id,
+    participantIds: Array.isArray(row.participant_ids)
+      ? row.participant_ids
+      : JSON.parse(row.participant_ids),
+    createdAt: Number(row.created_at),
+  };
+}
+
 // A single-attempt, non-retrying lock (unlike the read-modify-write lock
 // below, which retries). Used to let multiple server instances race to claim
 // a piece of periodic work — e.g. one wall-clock time bucket — without
 // duplicating it. Returns true if this call won the lock.
 export async function tryAcquireLock(key: string, ttlSeconds: number): Promise<boolean> {
+  if (pgPool && !globalPg.__jesterPgDisabled) {
+    try {
+      return await withPostgresClient(async (client) => {
+      const now = Date.now();
+      await client.query('delete from jester_locks where expires_at <= $1', [now]);
+      const result = await client.query(
+        `insert into jester_locks (key, expires_at)
+         values ($1, $2)
+         on conflict (key) do nothing`,
+        [key, now + ttlSeconds * 1000],
+      );
+      return result.rowCount === 1;
+      });
+    } catch (error) {
+      if (!globalPg.__jesterPgDisabled) throw error;
+    }
+  }
   if (!redis) return true;
   const acquired = await redis.set(key, '1', { nx: true, ex: ttlSeconds });
   return acquired === 'OK';
@@ -186,6 +354,34 @@ async function releaseLock(lockKey: string, token: string | null) {
 export async function withDatabase<T>(
   operation: (database: { data: Database }) => T | Promise<T>,
 ): Promise<T> {
+  if (pgPool && !globalPg.__jesterPgDisabled) {
+    try {
+      return await withPostgresClient(async (client) => {
+      await client.query('begin');
+      try {
+        const current = await client.query<{ data: Database }>(
+          `select data from jester_app_state where key = 'main' for update`,
+        );
+        const data = normalizeDatabase(current.rows[0]?.data);
+        const result = await operation({ data });
+        await client.query(
+          `insert into jester_app_state (key, data, updated_at)
+           values ('main', $1::jsonb, now())
+           on conflict (key) do update set data = excluded.data, updated_at = now()`,
+          [JSON.stringify(data)],
+        );
+        await client.query('commit');
+        return result;
+      } catch (error) {
+        await client.query('rollback');
+        throw error;
+      }
+      });
+    } catch (error) {
+      if (!globalPg.__jesterPgDisabled) throw error;
+    }
+  }
+
   if (!redis) {
     if (process.env.NODE_ENV === 'production') {
       throw new Error(
@@ -227,6 +423,46 @@ export async function withDatabase<T>(
 export async function withRoomIndex<T>(
   operation: (rooms: RoomRecord[]) => T | Promise<T>,
 ): Promise<T> {
+  if (pgPool && !globalPg.__jesterPgDisabled) {
+    try {
+      return await withPostgresClient(async (client) => {
+      await client.query('begin');
+      try {
+        await client.query(`select data from jester_app_state where key = 'room_index_lock' for update`);
+        const current = await client.query<{
+          id: string;
+          participant_ids: string[];
+          created_at: string | number;
+        }>('select id, participant_ids, created_at from jester_rooms order by created_at for update');
+        const rooms = current.rows.map(rowToRoom);
+        const result = await operation(rooms);
+        const keepIds = rooms.map((room) => room.id);
+        if (keepIds.length > 0) {
+          await client.query('delete from jester_rooms where not (id = any($1::text[]))', [keepIds]);
+        } else {
+          await client.query('delete from jester_rooms');
+        }
+        for (const room of rooms) {
+          await client.query(
+            `insert into jester_rooms (id, participant_ids, created_at)
+             values ($1, $2::jsonb, $3)
+             on conflict (id) do update
+             set participant_ids = excluded.participant_ids, created_at = excluded.created_at`,
+            [room.id, JSON.stringify(room.participantIds), room.createdAt],
+          );
+        }
+        await client.query('commit');
+        return result;
+      } catch (error) {
+        await client.query('rollback');
+        throw error;
+      }
+      });
+    } catch (error) {
+      if (!globalPg.__jesterPgDisabled) throw error;
+    }
+  }
+
   if (!redis) {
     return operation(localRooms);
   }
@@ -255,6 +491,25 @@ export async function withRoomIndex<T>(
 // of waiters could outlast the lock's retry budget and throw.
 
 export async function getRoomParticipants(roomId: string): Promise<ParticipantRecord[]> {
+  if (pgPool && !globalPg.__jesterPgDisabled) {
+    try {
+      return await withPostgresClient(async (client) => {
+      const result = await client.query<{
+        id: string;
+        room_id: string;
+        username: string;
+        last_seen: string | number;
+      }>(
+        'select id, room_id, username, last_seen from jester_participants where room_id = $1',
+        [roomId],
+      );
+      return result.rows.map(rowToParticipant);
+      });
+    } catch (error) {
+      if (!globalPg.__jesterPgDisabled) throw error;
+    }
+  }
+
   if (!redis) {
     return [...getLocalRoom(roomId).participants.values()];
   }
@@ -265,6 +520,23 @@ export async function getRoomParticipants(roomId: string): Promise<ParticipantRe
 // Only ever called by a participant to write their own record, so concurrent
 // callers never touch the same hash field.
 export async function upsertParticipant(participant: ParticipantRecord): Promise<void> {
+  if (pgPool && !globalPg.__jesterPgDisabled) {
+    try {
+      await withPostgresClient(async (client) => {
+      await client.query(
+        `insert into jester_participants (id, room_id, username, last_seen)
+         values ($1, $2, $3, $4)
+         on conflict (id) do update
+         set room_id = excluded.room_id, username = excluded.username, last_seen = excluded.last_seen`,
+        [participant.id, participant.roomId, participant.username, participant.lastSeen],
+      );
+      });
+      return;
+    } catch (error) {
+      if (!globalPg.__jesterPgDisabled) throw error;
+    }
+  }
+
   if (!redis) {
     getLocalRoom(participant.roomId).participants.set(participant.id, participant);
     return;
@@ -275,6 +547,24 @@ export async function upsertParticipant(participant: ParticipantRecord): Promise
 }
 
 export async function removeParticipant(roomId: string, participantId: string): Promise<void> {
+  if (pgPool && !globalPg.__jesterPgDisabled) {
+    try {
+      await withPostgresClient(async (client) => {
+      await client.query('delete from jester_participants where room_id = $1 and id = $2', [
+        roomId,
+        participantId,
+      ]);
+      await client.query('delete from jester_messages where room_id = $1 and participant_id = $2', [
+        roomId,
+        participantId,
+      ]);
+      });
+      return;
+    } catch (error) {
+      if (!globalPg.__jesterPgDisabled) throw error;
+    }
+  }
+
   if (!redis) {
     const room = getLocalRoom(roomId);
     room.participants.delete(participantId);
@@ -308,6 +598,20 @@ export async function pushMessage(
   participantId: string,
   message: SignalMessage,
 ): Promise<void> {
+  if (pgPool && !globalPg.__jesterPgDisabled) {
+    try {
+      await withPostgresClient(async (client) => {
+      await client.query(
+        'insert into jester_messages (room_id, participant_id, message) values ($1, $2, $3::jsonb)',
+        [roomId, participantId, JSON.stringify(message)],
+      );
+      });
+      return;
+    } catch (error) {
+      if (!globalPg.__jesterPgDisabled) throw error;
+    }
+  }
+
   if (!redis) {
     const room = getLocalRoom(roomId);
     const queue = room.messages.get(participantId) ?? [];
@@ -330,6 +634,35 @@ return msgs
 `;
 
 export async function drainMessages(roomId: string, participantId: string): Promise<SignalMessage[]> {
+  if (pgPool && !globalPg.__jesterPgDisabled) {
+    try {
+      return await withPostgresClient(async (client) => {
+      await client.query('begin');
+      try {
+        const result = await client.query<{ id: string; message: SignalMessage }>(
+          `select id, message
+           from jester_messages
+           where room_id = $1 and participant_id = $2
+           order by id
+           for update`,
+          [roomId, participantId],
+        );
+        const ids = result.rows.map((row) => row.id);
+        if (ids.length > 0) {
+          await client.query('delete from jester_messages where id = any($1::bigint[])', [ids]);
+        }
+        await client.query('commit');
+        return result.rows.map((row) => row.message);
+      } catch (error) {
+        await client.query('rollback');
+        throw error;
+      }
+      });
+    } catch (error) {
+      if (!globalPg.__jesterPgDisabled) throw error;
+    }
+  }
+
   if (!redis) {
     const room = getLocalRoom(roomId);
     const queue = room.messages.get(participantId) ?? [];
