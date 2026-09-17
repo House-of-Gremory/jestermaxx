@@ -242,11 +242,22 @@ async function ensurePostgresSchema() {
 
 function disablePostgresInDevelopment(error: unknown) {
   if (process.env.NODE_ENV === 'production') return false;
+  // In development, fall back to local store on ANY Postgres connection error
+  // (wrong password, unreachable host, schema issues, etc.) so the dev server
+  // never 500s — the app just uses in-memory storage until the next restart.
   const code = typeof error === 'object' && error && 'code' in error ? String(error.code) : '';
-  if (!['ENETUNREACH', 'EAI_AGAIN', 'ECONNREFUSED', 'ETIMEDOUT'].includes(code)) return false;
+  const message = error instanceof Error ? error.message : '';
+  const isConnectionError =
+    ['ENETUNREACH', 'EAI_AGAIN', 'ECONNREFUSED', 'ETIMEDOUT'].includes(code) ||
+    message.includes('password authentication failed') ||
+    message.includes('ECONNREFUSED') ||
+    message.includes('ENOTFOUND') ||
+    message.includes('could not connect');
+
+  if (!isConnectionError) return false;
 
   console.warn(
-    `Supabase Postgres is unreachable (${code}); using the local development store until the dev server restarts.`,
+    `Supabase Postgres is unreachable (${code || message.slice(0, 80)}); using the local development store until the dev server restarts.`,
   );
   globalPg.__jesterPgDisabled = true;
   globalPg.__jesterPgReady = undefined;

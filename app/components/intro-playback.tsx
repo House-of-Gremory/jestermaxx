@@ -8,6 +8,7 @@ export type IntroPlaybackSlide = {
   text: string;
   xPct: number;
   yPct: number;
+  pendingDataUrl?: string;
 };
 
 const ANIM_CLASS: Record<TransitionId, string> = {
@@ -74,7 +75,7 @@ export default function IntroPlayback({
       {/* eslint-disable-next-line @next/next/no-img-element */}
       <img
         key={`${index}-${transitionId}`}
-        src={slide.url}
+        src={slide.url || slide.pendingDataUrl || ''}
         alt=""
         className={`h-full w-full object-cover ${ANIM_CLASS[transitionId]}`}
       />

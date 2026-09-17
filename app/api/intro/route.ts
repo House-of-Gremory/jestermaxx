@@ -118,3 +118,21 @@ export async function GET(request: Request) {
 
   return Response.json({ intro: record ? resolveIntro(record) : null });
 }
+
+// Deletes a guest's intro record from the database. Called when a guest
+// explicitly leaves their session so their photos/username are removed.
+export async function DELETE(request: Request) {
+  const url = new URL(request.url);
+  const username = url.searchParams.get('username')?.trim();
+  if (!username) {
+    return Response.json({ error: 'username is required' }, { status: 400 });
+  }
+
+  await withDatabase((database) => {
+    database.data.intros = database.data.intros.filter(
+      (intro) => intro.username.toLowerCase() !== username.toLowerCase(),
+    );
+  });
+
+  return Response.json({ ok: true });
+}

@@ -20,16 +20,25 @@ export class HandDetector {
   private lastVideoTime = -1;
 
   async init(): Promise<void> {
-    // Same benign TFLite/XNNPACK init chatter as the face model.
-    this.landmarker = await withMediapipeLogsSilenced(async () => {
-      const vision = await loadVision();
-      const fileset = await vision.FilesetResolver.forVisionTasks(WASM_BASE);
-      return vision.HandLandmarker.createFromOptions(fileset, {
-        baseOptions: { modelAssetPath: MODEL_URL, delegate: 'GPU' },
-        runningMode: 'VIDEO',
-        numHands: 2,
-      });
-    });
+    const vision = await loadVision();
+    const fileset = await vision.FilesetResolver.forVisionTasks(WASM_BASE);
+    // Try GPU first, fall back to CPU for mobile Safari and restricted browsers.
+    for (const delegate of ['GPU', 'CPU'] as const) {
+      try {
+        this.landmarker = await withMediapipeLogsSilenced(async () => {
+          return vision.HandLandmarker.createFromOptions(fileset, {
+            baseOptions: { modelAssetPath: MODEL_URL, delegate },
+            runningMode: 'VIDEO',
+            numHands: 2,
+          });
+        });
+        return;
+      } catch (error) {
+        console.warn(`Hand detector ${delegate} init failed`, error);
+        this.landmarker = null;
+      }
+    }
+    throw new Error('Hand detector failed to initialize (GPU and CPU both unavailable)');
   }
 
   get ready() {

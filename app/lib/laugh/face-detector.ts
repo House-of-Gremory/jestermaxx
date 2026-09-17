@@ -55,16 +55,27 @@ export class FaceDetector {
   private lastVideoTime = -1;
 
   async init(): Promise<void> {
-    this.landmarker = await withMediapipeLogsSilenced(async () => {
-      const vision = await loadVision();
-      const fileset = await vision.FilesetResolver.forVisionTasks(WASM_BASE);
-      return vision.FaceLandmarker.createFromOptions(fileset, {
-        baseOptions: { modelAssetPath: MODEL_URL, delegate: 'GPU' },
-        runningMode: 'VIDEO',
-        numFaces: 1,
-        outputFaceBlendshapes: true,
-      });
-    });
+    const vision = await loadVision();
+    const fileset = await vision.FilesetResolver.forVisionTasks(WASM_BASE);
+    // Try GPU first (faster on desktop + Android), fall back to CPU for mobile
+    // Safari and browsers where WebGL + WASM is restricted.
+    for (const delegate of ['GPU', 'CPU'] as const) {
+      try {
+        this.landmarker = await withMediapipeLogsSilenced(async () => {
+          return vision.FaceLandmarker.createFromOptions(fileset, {
+            baseOptions: { modelAssetPath: MODEL_URL, delegate },
+            runningMode: 'VIDEO',
+            numFaces: 1,
+            outputFaceBlendshapes: true,
+          });
+        });
+        return;
+      } catch (error) {
+        console.warn(`Face detector ${delegate} init failed`, error);
+        this.landmarker = null;
+      }
+    }
+    throw new Error('Face detector failed to initialize (GPU and CPU both unavailable)');
   }
 
   get ready() {

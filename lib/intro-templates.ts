@@ -22,7 +22,14 @@ export const SLIDE_HOLD_MS = 1800;
 
 // Client-safe shapes (no fs/redis deps) shared by the API route and every
 // component that renders or caches a saved intro reel.
-export type IntroSlideResolved = { url: string; text: string; xPct: number; yPct: number };
+export type IntroSlideResolved = {
+  url: string;
+  text: string;
+  xPct: number;
+  yPct: number;
+  // Base64 image data, present until the slide is uploaded to R2.
+  pendingDataUrl?: string;
+};
 export type IntroRecordResolved = {
   username: string;
   slides: IntroSlideResolved[];

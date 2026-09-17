@@ -38,7 +38,7 @@ function fmtTime(seconds: number): string {
 }
 import IntroPlayback from './intro-playback';
 import { fetchIntro, loadCachedIntro, saveCachedIntro } from '../lib/intro-cache';
-import { loadSavedUsername, saveUsername } from '../lib/username';
+import { loadSavedUsername, saveUsername, clearSavedSession } from '../lib/username';
 import type { IntroRecordResolved } from '../../lib/intro-templates';
 
 type SignalMessage =
@@ -973,9 +973,9 @@ export default function VideoCall() {
   }
 
   // A signed-in player should never retype their name: read the account from
-  // the session and go straight in. Guests keep the old behaviour — the last
-  // name they used is prefilled into the form. All state is set after an await,
-  // so nothing is assigned synchronously in the effect body.
+  // the session and go straight in. Guests with a saved username + cached intro
+  // also auto-enter — no re-prompt. All state is set after an await, so nothing
+  // is assigned synchronously in the effect body.
   useEffect(() => {
     let cancelled = false;
     void (async () => {
@@ -992,8 +992,18 @@ export default function VideoCall() {
           await enterArena(accountName);
           return;
         }
+        // Guest: auto-enter if they have a saved username AND a cached intro.
         if (!accountName) {
           const saved = loadSavedUsername();
+          if (saved && !autoEnteredRef.current) {
+            const cached = loadCachedIntro(saved);
+            if (cached) {
+              autoEnteredRef.current = true;
+              setUsernameInput(saved);
+              await enterArena(saved);
+              return;
+            }
+          }
           if (saved) setUsernameInput(saved);
         }
       } catch {
@@ -1114,6 +1124,16 @@ export default function VideoCall() {
     setUsername('');
   }
 
+  // Completely clears a guest session: deletes intro from DB, removes
+  // username + intro cache from localStorage, and sends them back to /.
+  async function leaveSession() {
+    if (username) {
+      await fetch(`/api/intro?username=${encodeURIComponent(username)}`, { method: 'DELETE' }).catch(() => {});
+    }
+    clearSavedSession();
+    router.push('/');
+  }
+
   // From the result screen: clear it and immediately queue a fresh opponent.
   function playAgain() {
     setMatchResult(null);
@@ -1133,7 +1153,16 @@ export default function VideoCall() {
           <h1 className="text-lg font-black uppercase tracking-[0.3em]">
             JESTER<span className="text-lime-400">MAXX</span> ARENA
           </h1>
-          <span className="w-16" />
+          {!signedInAs && username ? (
+            <button
+              onClick={leaveSession}
+              className="text-[11px] font-bold uppercase tracking-widest text-white/40 transition hover:text-red-400"
+            >
+              Leave session
+            </button>
+          ) : (
+            <span className="w-16" />
+          )}
         </header>
 
         {!username && checkingAccount ? (
