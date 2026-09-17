@@ -5,7 +5,6 @@ import { useRouter } from 'next/navigation';
 import { type FormEvent, useCallback, useEffect, useRef, useState } from 'react';
 import { VoiceFilter } from '../lib/audio/voice-filter';
 import { useLaughDetector } from '../lib/laugh/use-laugh-detector';
-import { getSupabase, signalChannelTopic } from '../../lib/supabase-client';
 import type { ExpressionLabel, LaughEvent, ScoreReason } from '../lib/laugh/types';
 
 // Live expression readout shown on the local tile — coarse, honest labels only.
@@ -302,8 +301,6 @@ export default function VideoCall() {
   const participantIdRef = useRef<string | null>(null);
   const roomIdRef = useRef<string | null>(null);
   const sseRef = useRef<EventSource | null>(null);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const channelRef = useRef<any>(null);
   const stoppedRef = useRef(false);
   const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   // Full ICE server pool (incl. TURN), fetched once per call; held back from
@@ -372,7 +369,6 @@ export default function VideoCall() {
     if (!roomId || !participantId) return;
 
     stoppedRef.current = true;
-    if (channelRef.current) { channelRef.current.unsubscribe(); channelRef.current = null; }
     if (sseRef.current) { sseRef.current.close(); sseRef.current = null; }
     void fetch('/api/signaling', {
       method: 'POST',
@@ -736,41 +732,29 @@ export default function VideoCall() {
       }
     }
 
-    function connectRealtime() {
+    function connectSSE() {
       const participantId = participantIdRef.current;
-      if (stoppedRef.current || !participantId) return;
+      const roomId = roomIdRef.current;
+      if (stoppedRef.current || !participantId || !roomId) return;
 
-      const supabase = getSupabase();
-      if (!supabase) {
-        // Supabase not configured — fall back to the SSE endpoint.
-        const roomId = roomIdRef.current;
-        if (!roomId) return;
-        const es = new EventSource(
-          `/api/signaling?roomId=${encodeURIComponent(roomId)}&participantId=${encodeURIComponent(participantId)}`,
-        );
-        sseRef.current = es;
-        es.onmessage = (event) => {
-          if (stoppedRef.current || isStale()) return;
-          try {
-            const message = JSON.parse(event.data) as SignalMessage;
-            void handleSignal(message);
-          } catch {
-            // ignore
-          }
-        };
-        es.onerror = () => {};
-        return;
-      }
+      const es = new EventSource(
+        `/api/signaling?roomId=${encodeURIComponent(roomId)}&participantId=${encodeURIComponent(participantId)}`,
+      );
+      sseRef.current = es;
 
-      const channel = supabase.channel(signalChannelTopic(participantId));
-      channelRef.current = channel;
+      es.onmessage = (event) => {
+        if (stoppedRef.current || isStale()) return;
+        try {
+          const message = JSON.parse(event.data) as SignalMessage;
+          void handleSignal(message);
+        } catch {
+          // ignore parse error
+        }
+      };
 
-      channel
-        .on('broadcast', { event: 'signal' }, (payload: { payload: SignalMessage }) => {
-          if (stoppedRef.current || isStale()) return;
-          void handleSignal(payload.payload);
-        })
-        .subscribe();
+      es.onerror = () => {
+        // EventSource auto-reconnects.
+      };
     }
 
     async function start() {
@@ -905,7 +889,7 @@ export default function VideoCall() {
           joinData.waiting ? 'Waiting for an opponent to join…' : 'Opponent is already here. Connecting…',
         );
 
-        void connectRealtime();
+        void connectSSE();
       } catch {
         // Call startup error — ignore, status already shows "Try again".
         setStatus('Something went wrong. Try again.');
@@ -917,7 +901,6 @@ export default function VideoCall() {
     return () => {
       stoppedRef.current = true;
       window.removeEventListener('pagehide', sendByeBeacon);
-      if (channelRef.current) { channelRef.current.unsubscribe(); channelRef.current = null; }
       if (sseRef.current) { sseRef.current.close(); sseRef.current = null; }
       if (relayFallbackTimerRef.current) clearTimeout(relayFallbackTimerRef.current);
       void sendSignal({ type: 'bye' });
@@ -955,10 +938,8 @@ export default function VideoCall() {
   async function enterArena(rawName: string) {
     const name = rawName.trim().slice(0, 32);
     if (!name) return;
-    saveUsername(name); // keeps the intro builder and a signed-out revisit in sync
+    saveUsername(name);
 
-    // Only gates entry — the fetched record itself is never shown, since we
-    // only ever display the opponent's intro reel, never our own.
     const cached = loadCachedIntro(name);
     const intro = cached ?? (await fetchIntro(name));
     if (!intro) {

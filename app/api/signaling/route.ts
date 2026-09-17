@@ -8,7 +8,6 @@ import {
   type ParticipantRecord,
   type SignalMessage,
 } from '@/lib/db';
-import { getSupabase, signalChannelTopic } from '@/lib/supabase-client';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
@@ -48,22 +47,6 @@ async function releaseRoomFromIndex(roomId: string, participantId?: string) {
     });
   } catch {
     // Non-fatal: the index self-heals on next join.
-  }
-}
-
-// Best-effort Realtime broadcast. Fails silently when Supabase is not
-// configured — the queue-based fallback still works.
-async function broadcastSignal(participantId: string, message: SignalMessage) {
-  const supabase = getSupabase();
-  if (!supabase) return;
-  try {
-    await supabase.channel(signalChannelTopic(participantId)).send({
-      type: 'broadcast',
-      event: 'signal',
-      payload: message,
-    });
-  } catch {
-    // Non-fatal: the SSE tick-loop will deliver the message on the next poll.
   }
 }
 
@@ -123,7 +106,6 @@ export async function POST(request: Request) {
       await upsertParticipant(participant);
       if (existingParticipant) {
         await pushMessage(roomId, existingParticipant.id, { type: 'peer-joined', payload: { username } });
-        void broadcastSignal(existingParticipant.id, { type: 'peer-joined', payload: { username } });
       }
       const opponentUsername = existingParticipant?.username;
 
@@ -155,7 +137,6 @@ export async function POST(request: Request) {
     const otherParticipant = participants.find((candidate) => candidate.id !== participantId);
     if (otherParticipant) {
       await pushMessage(roomId, otherParticipant.id, message);
-      void broadcastSignal(otherParticipant.id, message);
     }
 
     if (message.type === 'bye') {
