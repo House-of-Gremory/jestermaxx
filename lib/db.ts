@@ -113,7 +113,12 @@ const pgPool =
     ? (globalPg.__jesterPgPool ??= new Pool({
         connectionString: postgresUrl,
         ssl: { rejectUnauthorized: false },
-        max: 6,
+        // Supabase pooler has a 15-connection limit shared across ALL serverless
+        // function invocations. Each invocation gets its own pool, so max=2 keeps
+        // us well under the limit while still allowing a single concurrent query.
+        max: 2,
+        connectionTimeoutMillis: 5_000,
+        idleTimeoutMillis: 10_000,
       }))
     : null;
 const REDIS_DATA_KEY = 'jestermaxing:signaling';
@@ -248,11 +253,14 @@ function disablePostgresInDevelopment(error: unknown) {
   const code = typeof error === 'object' && error && 'code' in error ? String(error.code) : '';
   const message = error instanceof Error ? error.message : '';
   const isConnectionError =
-    ['ENETUNREACH', 'EAI_AGAIN', 'ECONNREFUSED', 'ETIMEDOUT'].includes(code) ||
+    ['ENETUNREACH', 'EAI_AGAIN', 'ECONNREFUSED', 'ETIMEDOUT', 'EMAXCONNSESSION', 'EPIPE', 'ECONNRESET'].includes(code) ||
     message.includes('password authentication failed') ||
     message.includes('ECONNREFUSED') ||
     message.includes('ENOTFOUND') ||
-    message.includes('could not connect');
+    message.includes('could not connect') ||
+    message.includes('max clients reached') ||
+    message.includes('Connection terminated') ||
+    message.includes('connection timeout');
 
   if (!isConnectionError) return false;
 
@@ -265,21 +273,38 @@ function disablePostgresInDevelopment(error: unknown) {
   return true;
 }
 
+const PG_RETRY_ATTEMPTS = 3;
+const PG_RETRY_BASE_MS = 100;
+
+function isTransientPgError(error: unknown): boolean {
+  const code = typeof error === 'object' && error && 'code' in error ? String(error.code) : '';
+  return ['ETIMEOUT', 'ECONNRESET', 'EPIPE', '57P01', '57P02', '57P03', '08006', '08001', '08003'].includes(code);
+}
+
 async function withPostgresClient<T>(operation: (client: PoolClient) => Promise<T>): Promise<T> {
   if (!pgPool) throw new Error('Postgres is not configured');
-  try {
-    await ensurePostgresSchema();
-    if (globalPg.__jesterPgDisabled) throw new Error('Postgres is disabled');
-    const client = await pgPool.connect();
+  let lastError: unknown;
+  for (let attempt = 0; attempt < PG_RETRY_ATTEMPTS; attempt += 1) {
     try {
-      return await operation(client);
-    } finally {
-      client.release();
+      await ensurePostgresSchema();
+      if (globalPg.__jesterPgDisabled) throw new Error('Postgres is disabled');
+      const client = await pgPool.connect();
+      try {
+        return await operation(client);
+      } finally {
+        client.release();
+      }
+    } catch (error) {
+      lastError = error;
+      if (disablePostgresInDevelopment(error)) throw new Error('Postgres is disabled');
+      if (attempt < PG_RETRY_ATTEMPTS - 1 && isTransientPgError(error)) {
+        await new Promise((r) => setTimeout(r, PG_RETRY_BASE_MS * 2 ** attempt));
+        continue;
+      }
+      throw error;
     }
-  } catch (error) {
-    if (disablePostgresInDevelopment(error)) throw new Error('Postgres is disabled');
-    throw error;
   }
+  throw lastError;
 }
 
 function rowToParticipant(row: {
@@ -389,15 +414,24 @@ export async function withDatabase<T>(
       }
       });
     } catch (error) {
-      if (!globalPg.__jesterPgDisabled) throw error;
+      if (disablePostgresInDevelopment(error)) {
+        // Dev: fell back to local store — continue below
+      } else {
+        // Production: Postgres is down but we can still serve from local
+        // memory so the app doesn't 503. Matchmaking will be per-instance
+        // (no cross-instance sharing) until Postgres recovers.
+        console.error('Postgres unavailable, falling back to local store', error);
+      }
     }
   }
 
   if (!redis) {
+    // In production without Redis: use local store as a degraded fallback.
+    // Matchmaking is per-instance (Vercel spins up many), so only players
+    // hitting the same instance can be matched. Good enough to keep the app
+    // alive while Postgres/Redis are being configured.
     if (process.env.NODE_ENV === 'production') {
-      throw new Error(
-        'Redis is not configured. Set UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN.',
-      );
+      console.warn('Redis is not configured — using local in-memory store (per-instance only).');
     }
     // Guards against a dev-server hot reload keeping an older globalThis
     // object around from before a field (e.g. `intros`) was added here.
@@ -470,7 +504,11 @@ export async function withRoomIndex<T>(
       }
       });
     } catch (error) {
-      if (!globalPg.__jesterPgDisabled) throw error;
+      if (disablePostgresInDevelopment(error)) {
+        // Dev: fell back to local store
+      } else {
+        console.error('Postgres unavailable for room index, falling back to local store', error);
+      }
     }
   }
 

@@ -156,11 +156,6 @@ const FALLBACK_ICE_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.cloudflare.com:3478' },
 ];
 
-// How often the client polls for signaling messages. Lower = faster handshake
-// (and faster ghost cleanup, since each poll refreshes lastSeen) at the cost of
-// more requests. 400ms keeps connection setup snappy without hammering.
-const POLL_INTERVAL_MS = 400;
-
 // First attempt connects with STUN only (no TURN in the config at all), so no
 // relay allocation happens unless it's actually needed — host candidates
 // still cover both IPv4 and IPv6 automatically (the browser gathers every
@@ -305,7 +300,7 @@ export default function VideoCall() {
   const localStreamRef = useRef<MediaStream | null>(null);
   const participantIdRef = useRef<string | null>(null);
   const roomIdRef = useRef<string | null>(null);
-  const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sseRef = useRef<EventSource | null>(null);
   const stoppedRef = useRef(false);
   const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   // Full ICE server pool (incl. TURN), fetched once per call; held back from
@@ -374,9 +369,9 @@ export default function VideoCall() {
     if (!roomId || !participantId) return;
 
     stoppedRef.current = true;
-    if (pollTimerRef.current) {
-      clearTimeout(pollTimerRef.current);
-      pollTimerRef.current = null;
+    if (sseRef.current) {
+      sseRef.current.close();
+      sseRef.current = null;
     }
     void fetch('/api/signaling', {
       method: 'POST',
@@ -740,38 +735,36 @@ export default function VideoCall() {
       }
     }
 
-    async function pollSignals() {
+    function connectSSE() {
       const participantId = participantIdRef.current;
       const roomId = roomIdRef.current;
       if (stoppedRef.current || !participantId || !roomId) return;
 
-      try {
-        const response = await fetch(
-          `/api/signaling?roomId=${encodeURIComponent(roomId)}&participantId=${encodeURIComponent(participantId)}`,
-          { cache: 'no-store' },
-        );
-        if (response.ok) {
-          const data = (await response.json()) as { messages: SignalMessage[] };
-          // This response may have been in flight while the match ended and a
-          // new one started. Applying it now would corrupt the fresh scoreboard.
-          if (isStale()) return;
-          for (const message of data.messages) {
-            try {
-              await handleSignal(message);
-            } catch (error) {
-              console.error('Failed to handle signal', message.type, error);
-            }
-          }
-        } else {
-          console.error('Signaling poll failed', response.status);
-        }
-      } catch (error) {
-        console.error('Signaling poll error', error);
-      }
+      const es = new EventSource(
+        `/api/signaling?roomId=${encodeURIComponent(roomId)}&participantId=${encodeURIComponent(participantId)}`,
+      );
+      sseRef.current = es;
 
-      if (!stoppedRef.current && !isStale()) {
-        pollTimerRef.current = setTimeout(pollSignals, POLL_INTERVAL_MS);
-      }
+      es.onmessage = (event) => {
+        if (stoppedRef.current || isStale()) return;
+        try {
+          const message = JSON.parse(event.data) as SignalMessage;
+          void handleSignal(message);
+        } catch (error) {
+          console.error('Failed to handle SSE signal', error);
+        }
+      };
+
+      es.addEventListener('expired', () => {
+        es.close();
+        sseRef.current = null;
+      });
+
+      es.onerror = () => {
+        // EventSource auto-reconnects. If the connection is permanently lost
+        // (server returned a non-2xx), the browser will stop retrying after a
+        // few attempts. Nothing to do here — the reconnect loop is built in.
+      };
     }
 
     async function start() {
@@ -906,7 +899,7 @@ export default function VideoCall() {
           joinData.waiting ? 'Waiting for an opponent to join…' : 'Opponent is already here. Connecting…',
         );
 
-        void pollSignals();
+        void connectSSE();
       } catch (error) {
         console.error('Failed to start call', error);
         setStatus(
@@ -920,7 +913,7 @@ export default function VideoCall() {
     return () => {
       stoppedRef.current = true;
       window.removeEventListener('pagehide', sendByeBeacon);
-      if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
+      if (sseRef.current) { sseRef.current.close(); sseRef.current = null; }
       if (relayFallbackTimerRef.current) clearTimeout(relayFallbackTimerRef.current);
       void sendSignal({ type: 'bye' });
       peerConnectionRef.current?.close();

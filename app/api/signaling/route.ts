@@ -16,10 +16,17 @@ function createId(prefix: string) {
   return `${prefix}-${crypto.randomUUID()}`;
 }
 
-// A live client polls every ~400ms (refreshing lastSeen), so 12s without a
-// single successful poll means the tab is really gone. Shorter than the old 30s
-// so ghost participants stop occupying rooms and blocking new matches.
+// With SSE, lastSeen is refreshed ~10x/sec on the server side. 12s without a
+// heartbeat means the tab is really gone.
 const PARTICIPANT_TTL_MS = 12_000;
+
+// How often the server-side SSE loop checks for new messages and refreshes
+// lastSeen. 100ms keeps message delivery near-instant without hammering the DB.
+const SSE_TICK_MS = 100;
+
+// Send a SSE comment (": heartbeat\n\n") every 5s so proxies / load balancers
+// don't close the idle connection.
+const SSE_HEARTBEAT_MS = 5_000;
 
 // Best-effort: drop a room from the matchmaking index once it's actually
 // empty, so it stops being counted as "full" or getting matched into. Safe
@@ -154,20 +161,92 @@ export async function GET(request: Request) {
     return Response.json({ messages: [] }, { status: 404 });
   }
 
+  // Validate the participant exists before opening the stream so the client
+  // gets an immediate error instead of a hanging connection.
   try {
     const participants = await pruneRoomParticipants(roomId, Date.now() - PARTICIPANT_TTL_MS);
-    const participant = participants.find((candidate) => candidate.id === participantId);
-
+    const participant = participants.find((c) => c.id === participantId);
     if (!participant) {
       if (participants.length === 0) void releaseRoomFromIndex(roomId);
       return Response.json({ messages: [] }, { status: 404 });
     }
-
     await upsertParticipant({ ...participant, lastSeen: Date.now() });
-    const messages = await drainMessages(roomId, participantId);
-    return Response.json({ messages });
   } catch (error) {
-    console.error('Signaling GET failed', error);
-    return Response.json({ messages: [] }, { status: 503 });
+    console.error('Signaling SSE initial check failed', error);
+    return Response.json({ messages: [] });
   }
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let heartbeat: ReturnType<typeof setInterval> | undefined;
+  let closed = false;
+
+  const stream = new ReadableStream({
+    start(controller) {
+      const encoder = new TextEncoder();
+      const send = (data: string) => {
+        if (!closed) controller.enqueue(encoder.encode(data));
+      };
+
+      // Immediately flush any messages that were already queued (e.g. the
+      // peer-joined that triggered this SSE connection).
+      void (async () => {
+        try {
+          const msgs = await drainMessages(roomId, participantId);
+          for (const m of msgs) send(`data: ${JSON.stringify(m)}\n\n`);
+        } catch {
+          // Transient error — the tick loop will retry.
+        }
+      })();
+
+      const tick = async () => {
+        if (closed) return;
+        try {
+          const participants = await pruneRoomParticipants(roomId, Date.now() - PARTICIPANT_TTL_MS);
+          const participant = participants.find((c) => c.id === participantId);
+
+          if (!participant) {
+            send('event: expired\ndata: {}\n\n');
+            controller.close();
+            return;
+          }
+
+          await upsertParticipant({ ...participant, lastSeen: Date.now() });
+          const msgs = await drainMessages(roomId, participantId);
+          for (const m of msgs) send(`data: ${JSON.stringify(m)}\n\n`);
+        } catch (error) {
+          console.error('SSE tick error', error);
+        }
+
+        if (!closed) timer = setTimeout(tick, SSE_TICK_MS);
+      };
+
+      timer = setTimeout(tick, SSE_TICK_MS);
+
+      // Keep-alive comment so proxies don't kill the connection.
+      heartbeat = setInterval(() => send(': heartbeat\n\n'), SSE_HEARTBEAT_MS);
+    },
+
+    cancel() {
+      closed = true;
+      if (timer) clearTimeout(timer);
+      if (heartbeat) clearInterval(heartbeat);
+    },
+  });
+
+  // Abort the stream when the client disconnects.
+  request.signal.addEventListener('abort', () => {
+    closed = true;
+    if (timer) clearTimeout(timer);
+    if (heartbeat) clearInterval(heartbeat);
+    try { stream.cancel(); } catch { /* already closed */ }
+  });
+
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+    },
+  });
 }
