@@ -70,7 +70,7 @@ export default function Landing() {
 
           <div className="mt-9 flex flex-col items-center gap-3 sm:flex-row">
             <Link
-              href="/intro"
+              href="/arena"
               className="rounded-xl bg-lime-400 px-8 py-3.5 text-sm font-black uppercase tracking-widest text-black shadow-[0_0_30px_rgba(163,230,53,0.5)] transition hover:-translate-y-0.5 hover:bg-lime-300"
             >
               Enter the Arena

@@ -113,11 +113,10 @@ const pgPool =
     ? (globalPg.__jesterPgPool ??= new Pool({
         connectionString: postgresUrl,
         ssl: { rejectUnauthorized: false },
-        // Supabase pooler has a 15-connection limit shared across ALL serverless
-        // function invocations. Each invocation gets its own pool, so max=2 keeps
-        // us well under the limit while still allowing a single concurrent query.
-        max: 2,
-        connectionTimeoutMillis: 5_000,
+        // Direct Supabase connection (bypasses PgBouncer pooler).
+        // No shared pooler limit — each invocation gets its own pool.
+        max: 4,
+        connectionTimeoutMillis: 3_000,
         idleTimeoutMillis: 10_000,
       }))
     : null;
@@ -141,6 +140,10 @@ function roomMessagesKey(roomId: string, participantId: string) {
 // (see the lock-free room store below), so this is what actually reclaims
 // dead rooms.
 const ROOM_KEY_TTL_SECONDS = 60 * 60;
+
+// Client polls every ~400ms (refreshing lastSeen), so 12s without a
+// single successful poll means the tab is really gone.
+const PARTICIPANT_TTL_MS = 12_000;
 
 // Local development fallback. Vercel instances do not share process memory,
 // so production requires the shared Redis store configured above.
@@ -566,6 +569,29 @@ export async function getRoomParticipants(roomId: string): Promise<ParticipantRe
   return raw ? Object.values(raw) : [];
 }
 
+// Lightweight single-query lookup: find the other participant in a room.
+// Used for in-memory SSE notification — no pruning, no deletes, just a read.
+export async function findRoomOpponent(roomId: string, excludeId: string): Promise<ParticipantRecord | null> {
+  if (pgPool && !globalPg.__jesterPgDisabled) {
+    try {
+      return await withPostgresClient(async (client) => {
+        const result = await client.query<{ id: string; room_id: string; username: string; last_seen: string | number }>(
+          `SELECT id, room_id, username, last_seen FROM jester_participants
+           WHERE room_id = $1 AND id != $2
+           LIMIT 1`,
+          [roomId, excludeId],
+        );
+        return result.rows[0] ? rowToParticipant(result.rows[0]) : null;
+      });
+    } catch (error) {
+      if (!globalPg.__jesterPgDisabled) throw error;
+    }
+  }
+  // Fallback: local/Redis.
+  const all = await getRoomParticipants(roomId);
+  return all.find((p) => p.id !== excludeId) ?? null;
+}
+
 // Only ever called by a participant to write their own record, so concurrent
 // callers never touch the same hash field.
 export async function upsertParticipant(participant: ParticipantRecord): Promise<void> {
@@ -624,6 +650,125 @@ export async function removeParticipant(roomId: string, participantId: string): 
     redis.hdel(roomParticipantsKey(roomId), participantId),
     redis.del(roomMessagesKey(roomId, participantId)),
   ]);
+}
+
+// --- Batched operations: single Postgres connection + transaction per call ---
+// These replace the pattern of calling getRoomParticipants / upsertParticipant /
+// drainMessages / pushMessage separately (each opens its own connection). On a
+// remote pooler with limited connections, batching 3-4 queries into 1 connection
+// is the difference between "works" and "times out at 5s".
+
+export async function heartbeatAndDrain(
+  roomId: string,
+  participantId: string,
+): Promise<{ messages: SignalMessage[] } | null> {
+  if (pgPool && !globalPg.__jesterPgDisabled) {
+    try {
+      return await withPostgresClient(async (client) => {
+        await client.query('BEGIN');
+        try {
+          const now = Date.now();
+          // Check participant exists + refresh lastSeen in one query.
+          const res = await client.query<{ id: string }>(
+            `UPDATE jester_participants SET last_seen = $1
+             WHERE id = $2 AND room_id = $3
+             RETURNING id`,
+            [now, participantId, roomId],
+          );
+          if (res.rowCount === 0) {
+            await client.query('ROLLBACK');
+            return null;
+          }
+          // Drain messages atomically.
+          const msgs = await client.query<{ id: string; message: SignalMessage }>(
+            `SELECT id, message FROM jester_messages
+             WHERE room_id = $1 AND participant_id = $2
+             ORDER BY id FOR UPDATE`,
+            [roomId, participantId],
+          );
+          const ids = msgs.rows.map((r) => r.id);
+          if (ids.length > 0) {
+            await client.query('DELETE FROM jester_messages WHERE id = ANY($1::bigint[])', [ids]);
+          }
+          await client.query('COMMIT');
+          return { messages: msgs.rows.map((r) => r.message) };
+        } catch (error) {
+          await client.query('ROLLBACK');
+          throw error;
+        }
+      });
+    } catch (error) {
+      if (!globalPg.__jesterPgDisabled) throw error;
+    }
+  }
+
+  // Fallback: local/Redis path uses existing individual functions.
+  const participants = await getRoomParticipants(roomId);
+  const participant = participants.find((c) => c.id === participantId);
+  if (!participant) return null;
+  await upsertParticipant({ ...participant, lastSeen: Date.now() });
+  const messages = await drainMessages(roomId, participantId);
+  return { messages };
+}
+
+export async function heartbeatAndPush(
+  roomId: string,
+  participantId: string,
+  message: SignalMessage,
+): Promise<{ status: 'ok' | 'not_found'; opponentId?: string }> {
+  if (pgPool && !globalPg.__jesterPgDisabled) {
+    try {
+      return await withPostgresClient(async (client) => {
+        await client.query('BEGIN');
+        try {
+          const now = Date.now();
+          // Refresh lastSeen + find the other participant in one query.
+          const other = await client.query<{ id: string }>(
+            `SELECT p.id FROM jester_participants p
+             WHERE p.room_id = $1 AND p.id != $2
+             AND p.last_seen > $3
+             LIMIT 1`,
+            [roomId, participantId, now - PARTICIPANT_TTL_MS],
+          );
+          // Check sender exists + heartbeat.
+          const res = await client.query<{ id: string }>(
+            `UPDATE jester_participants SET last_seen = $1
+             WHERE id = $2 AND room_id = $3
+             RETURNING id`,
+            [now, participantId, roomId],
+          );
+          if (res.rowCount === 0) {
+            await client.query('ROLLBACK');
+            return { status: 'not_found' as const };
+          }
+          const opponentId = (other.rowCount && other.rowCount > 0) ? other.rows[0].id : undefined;
+          // Push message to opponent if they exist.
+          if (opponentId) {
+            await client.query(
+              'INSERT INTO jester_messages (room_id, participant_id, message) VALUES ($1, $2, $3::jsonb)',
+              [roomId, opponentId, JSON.stringify(message)],
+            );
+          }
+          await client.query('COMMIT');
+          return { status: 'ok' as const, opponentId };
+        } catch (error) {
+          await client.query('ROLLBACK');
+          throw error;
+        }
+      });
+    } catch (error) {
+      if (!globalPg.__jesterPgDisabled) throw error;
+    }
+  }
+
+  // Fallback: local/Redis path.
+  const participants = await pruneRoomParticipants(roomId, Date.now() - PARTICIPANT_TTL_MS);
+  const participant = participants.find((c) => c.id === participantId);
+  if (!participant) return { status: 'not_found' as const };
+  await upsertParticipant({ ...participant, lastSeen: Date.now() });
+  const other = participants.find((c) => c.id !== participantId);
+  if (other) await pushMessage(roomId, other.id, message);
+  return { status: 'ok' as const, opponentId: other?.id };
 }
 
 // Drops participants that haven't polled/posted inside the TTL and returns

@@ -149,6 +149,15 @@ function parseGiftMedia(input: string): GiftMedia | null {
 // last synced value (their clock may hit zero slightly after ours).
 const MATCH_END_GRACE_MS = 2500;
 
+const SSE_RETRY_MS = 2000;
+
+function randomGuestName(): string {
+  const adjectives = ['Wild', 'Sneaky', 'Chaotic', 'Fierce', 'Silly', 'Bold', 'Sly', 'Loud', 'Quick', 'Calm'];
+  const nouns = ['Clown', 'Fox', 'Ghost', 'Duck', 'Wizard', 'Gremlin', 'Imp', 'Pixie', 'Rogue', 'Goblin'];
+  const num = Math.floor(Math.random() * 999);
+  return `${adjectives[Math.floor(Math.random() * adjectives.length)]}${nouns[Math.floor(Math.random() * nouns.length)]}${num}`;
+}
+
 const FALLBACK_ICE_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
@@ -753,7 +762,13 @@ export default function VideoCall() {
       };
 
       es.onerror = () => {
-        // EventSource auto-reconnects.
+        // EventSource auto-reconnects. If the server closed the stream
+        // (expired event), reconnect after a delay.
+        es.close();
+        sseRef.current = null;
+        if (!stoppedRef.current && !isStale()) {
+          setTimeout(connectSSE, SSE_RETRY_MS);
+        }
       };
     }
 
@@ -931,7 +946,7 @@ export default function VideoCall() {
   // yet, send the player to build one and come straight back here after.
   async function joinCall(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    await enterArena(usernameInput);
+    await enterArena(usernameInput || randomGuestName());
   }
 
   // Shared by the manual form and the signed-in auto-entry below.
@@ -942,11 +957,7 @@ export default function VideoCall() {
 
     const cached = loadCachedIntro(name);
     const intro = cached ?? (await fetchIntro(name));
-    if (!intro) {
-      router.push(`/intro?username=${encodeURIComponent(name)}&next=/arena`);
-      return;
-    }
-    if (!cached) saveCachedIntro(name, intro);
+    if (intro && !cached) saveCachedIntro(name, intro);
 
     setUsername(name);
   }
@@ -971,23 +982,24 @@ export default function VideoCall() {
           await enterArena(accountName);
           return;
         }
-        // Guest: auto-enter if they have a saved username AND a cached intro.
+        // Guest: auto-enter immediately with a random name (or saved one).
         if (!accountName) {
           const saved = loadSavedUsername();
-          if (saved && !autoEnteredRef.current) {
-            const cached = loadCachedIntro(saved);
-            if (cached) {
-              autoEnteredRef.current = true;
-              setUsernameInput(saved);
-              await enterArena(saved);
-              return;
-            }
+          const name = saved || randomGuestName();
+          if (!autoEnteredRef.current) {
+            autoEnteredRef.current = true;
+            setUsernameInput(name);
+            await enterArena(name);
+            return;
           }
-          if (saved) setUsernameInput(saved);
         }
       } catch {
-        const saved = loadSavedUsername();
-        if (!cancelled && saved) setUsernameInput(saved);
+        if (!cancelled && !autoEnteredRef.current) {
+          autoEnteredRef.current = true;
+          const name = randomGuestName();
+          setUsernameInput(name);
+          await enterArena(name);
+        }
       } finally {
         if (!cancelled) setCheckingAccount(false);
       }
@@ -997,7 +1009,6 @@ export default function VideoCall() {
     };
     // enterArena is a stable declaration in this component; re-running on every
     // render would re-enter the arena in a loop.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Leave the current opponent and immediately look for a different one. The
@@ -1144,37 +1155,9 @@ export default function VideoCall() {
           )}
         </header>
 
-        {!username && checkingAccount ? (
+        {!username ? (
           <section className="flex flex-1 flex-col items-center justify-center">
             <p className="text-sm uppercase tracking-[0.3em] text-white/40">Loading…</p>
-          </section>
-        ) : !username ? (
-          <section className="flex flex-1 flex-col items-center justify-center">
-            <form
-              onSubmit={joinCall}
-              className="flex w-full max-w-sm flex-col gap-4 rounded-2xl border border-white/10 bg-white/[0.03] p-8"
-            >
-              <label htmlFor="username" className="text-xs font-bold uppercase tracking-widest text-white/60">
-                Your name
-              </label>
-              <input
-                id="username"
-                name="username"
-                value={usernameInput}
-                onChange={(event) => setUsernameInput(event.target.value)}
-                maxLength={32}
-                required
-                autoComplete="nickname"
-                placeholder="e.g. jester42"
-                className="rounded-xl border border-white/15 bg-black/40 px-4 py-3 text-white outline-none transition focus:border-lime-400"
-              />
-              <button
-                type="submit"
-                className="rounded-xl bg-lime-400 px-6 py-3 text-sm font-black uppercase tracking-widest text-black transition hover:bg-lime-300"
-              >
-                Enter the Arena
-              </button>
-            </form>
           </section>
         ) : (
           <section className="flex flex-1 flex-col">
