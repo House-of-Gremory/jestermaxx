@@ -12,6 +12,7 @@
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1102.0",
     "@mediapipe/tasks-vision": "^1.0.0",
+    "@supabase/supabase-js": "^2.116.0",
     "@types/pg": "^8.23.1",
     "@upstash/redis": "^1.38.0",
     "lowdb": "^7.0.1",

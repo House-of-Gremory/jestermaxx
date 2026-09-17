@@ -290,7 +290,7 @@ export default function IntroBuilder() {
         {stage === 'capture' && (
           <section className="flex flex-1 flex-col">
             <p className="mb-4 text-center text-sm text-white/70">
-              Photo {Math.min(capturedCount + 1, SLIDE_COUNT)} of {SLIDE_COUNT} — this also checks your camera.
+              Photo {Math.min(capturedCount + 1, SLIDE_COUNT)} of {SLIDE_COUNT}
             </p>
 
             <div className="relative aspect-video w-full overflow-hidden rounded-2xl border border-white/10 bg-black">
@@ -455,10 +455,6 @@ export default function IntroBuilder() {
 
         {(stage === 'preview' || stage === 'saving') && (
           <section className="flex flex-1 flex-col">
-            <p className="mb-4 text-center text-sm text-white/70">
-              This plays while your opponent connects — instead of a loading screen.
-            </p>
-
             <div className="mx-auto aspect-video w-full max-w-md overflow-hidden rounded-2xl border border-white/10">
               <IntroPlayback slides={previewSlides} transitionId={transitionId} />
             </div>

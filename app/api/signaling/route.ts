@@ -8,6 +8,7 @@ import {
   type ParticipantRecord,
   type SignalMessage,
 } from '@/lib/db';
+import { getSupabase, signalChannelTopic } from '@/lib/supabase-client';
 
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
@@ -45,8 +46,24 @@ async function releaseRoomFromIndex(roomId: string, participantId?: string) {
         rooms.splice(index, 1);
       }
     });
-  } catch (error) {
-    console.error('Failed to release room from matchmaking index', roomId, error);
+  } catch {
+    // Non-fatal: the index self-heals on next join.
+  }
+}
+
+// Best-effort Realtime broadcast. Fails silently when Supabase is not
+// configured — the queue-based fallback still works.
+async function broadcastSignal(participantId: string, message: SignalMessage) {
+  const supabase = getSupabase();
+  if (!supabase) return;
+  try {
+    await supabase.channel(signalChannelTopic(participantId)).send({
+      type: 'broadcast',
+      event: 'signal',
+      payload: message,
+    });
+  } catch {
+    // Non-fatal: the SSE tick-loop will deliver the message on the next poll.
   }
 }
 
@@ -106,6 +123,7 @@ export async function POST(request: Request) {
       await upsertParticipant(participant);
       if (existingParticipant) {
         await pushMessage(roomId, existingParticipant.id, { type: 'peer-joined', payload: { username } });
+        void broadcastSignal(existingParticipant.id, { type: 'peer-joined', payload: { username } });
       }
       const opponentUsername = existingParticipant?.username;
 
@@ -135,7 +153,10 @@ export async function POST(request: Request) {
     await upsertParticipant({ ...participant, lastSeen: Date.now() });
 
     const otherParticipant = participants.find((candidate) => candidate.id !== participantId);
-    if (otherParticipant) await pushMessage(roomId, otherParticipant.id, message);
+    if (otherParticipant) {
+      await pushMessage(roomId, otherParticipant.id, message);
+      void broadcastSignal(otherParticipant.id, message);
+    }
 
     if (message.type === 'bye') {
       await removeParticipant(roomId, participantId);
@@ -143,8 +164,7 @@ export async function POST(request: Request) {
     }
 
     return Response.json({ ok: true });
-  } catch (error) {
-    console.error('Signaling POST failed', error);
+  } catch {
     return Response.json(
       { error: 'Signaling temporarily unavailable' },
       { status: 503 },
@@ -171,8 +191,7 @@ export async function GET(request: Request) {
       return Response.json({ messages: [] }, { status: 404 });
     }
     await upsertParticipant({ ...participant, lastSeen: Date.now() });
-  } catch (error) {
-    console.error('Signaling SSE initial check failed', error);
+  } catch {
     return Response.json({ messages: [] });
   }
 
@@ -213,8 +232,8 @@ export async function GET(request: Request) {
           await upsertParticipant({ ...participant, lastSeen: Date.now() });
           const msgs = await drainMessages(roomId, participantId);
           for (const m of msgs) send(`data: ${JSON.stringify(m)}\n\n`);
-        } catch (error) {
-          console.error('SSE tick error', error);
+        } catch {
+          // Transient error — the tick loop will retry.
         }
 
         if (!closed) timer = setTimeout(tick, SSE_TICK_MS);

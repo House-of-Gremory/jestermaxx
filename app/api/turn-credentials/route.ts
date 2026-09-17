@@ -53,8 +53,7 @@ async function getCloudflareEnvCredentials(): Promise<IceServerEntry[]> {
       ttlSeconds: process.env.CLOUDFLARE_TURN_TTL_SECONDS ?? '86400',
     });
     return [{ urls: credentials.urls, username: credentials.username, credential: credentials.credential }];
-  } catch (error) {
-    console.error('Failed to fetch Cloudflare TURN credentials', error);
+  } catch {
     return [];
   }
 }

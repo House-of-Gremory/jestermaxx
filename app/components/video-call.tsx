@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation';
 import { type FormEvent, useCallback, useEffect, useRef, useState } from 'react';
 import { VoiceFilter } from '../lib/audio/voice-filter';
 import { useLaughDetector } from '../lib/laugh/use-laugh-detector';
+import { getSupabase, signalChannelTopic } from '../../lib/supabase-client';
 import type { ExpressionLabel, LaughEvent, ScoreReason } from '../lib/laugh/types';
 
 // Live expression readout shown on the local tile — coarse, honest labels only.
@@ -214,12 +215,12 @@ async function getLocalStream(
   for (const constraints of attempts) {
     try {
       return await navigator.mediaDevices.getUserMedia(constraints);
-    } catch (error) {
-      console.warn('getUserMedia failed for', constraints, (error as Error).name);
+    } catch {
+      // Silently try next weaker constraint set.
     }
   }
 
-  setStatus('No camera or microphone available — joining as a viewer.');
+  setStatus('Joining…');
   return null;
 }
 
@@ -301,6 +302,8 @@ export default function VideoCall() {
   const participantIdRef = useRef<string | null>(null);
   const roomIdRef = useRef<string | null>(null);
   const sseRef = useRef<EventSource | null>(null);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const channelRef = useRef<any>(null);
   const stoppedRef = useRef(false);
   const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   // Full ICE server pool (incl. TURN), fetched once per call; held back from
@@ -369,10 +372,8 @@ export default function VideoCall() {
     if (!roomId || !participantId) return;
 
     stoppedRef.current = true;
-    if (sseRef.current) {
-      sseRef.current.close();
-      sseRef.current = null;
-    }
+    if (channelRef.current) { channelRef.current.unsubscribe(); channelRef.current = null; }
+    if (sseRef.current) { sseRef.current.close(); sseRef.current = null; }
     void fetch('/api/signaling', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -580,7 +581,7 @@ export default function VideoCall() {
         relayFallbackTimerRef.current = null;
       }
 
-      setStatus('Direct connection is slow — falling back to relay…');
+      setStatus('');
       peerConnection.setConfiguration({ iceServers: fullIceServersRef.current });
 
       if (isCallerRef.current) {
@@ -688,7 +689,7 @@ export default function VideoCall() {
           return;
         }
         setConnected(false);
-        setStatus('Opponent left. Tap “Next player” to find someone new.');
+        setStatus('Opponent left.');
         return;
       }
 
@@ -735,36 +736,41 @@ export default function VideoCall() {
       }
     }
 
-    function connectSSE() {
+    function connectRealtime() {
       const participantId = participantIdRef.current;
-      const roomId = roomIdRef.current;
-      if (stoppedRef.current || !participantId || !roomId) return;
+      if (stoppedRef.current || !participantId) return;
 
-      const es = new EventSource(
-        `/api/signaling?roomId=${encodeURIComponent(roomId)}&participantId=${encodeURIComponent(participantId)}`,
-      );
-      sseRef.current = es;
+      const supabase = getSupabase();
+      if (!supabase) {
+        // Supabase not configured — fall back to the SSE endpoint.
+        const roomId = roomIdRef.current;
+        if (!roomId) return;
+        const es = new EventSource(
+          `/api/signaling?roomId=${encodeURIComponent(roomId)}&participantId=${encodeURIComponent(participantId)}`,
+        );
+        sseRef.current = es;
+        es.onmessage = (event) => {
+          if (stoppedRef.current || isStale()) return;
+          try {
+            const message = JSON.parse(event.data) as SignalMessage;
+            void handleSignal(message);
+          } catch {
+            // ignore
+          }
+        };
+        es.onerror = () => {};
+        return;
+      }
 
-      es.onmessage = (event) => {
-        if (stoppedRef.current || isStale()) return;
-        try {
-          const message = JSON.parse(event.data) as SignalMessage;
-          void handleSignal(message);
-        } catch (error) {
-          console.error('Failed to handle SSE signal', error);
-        }
-      };
+      const channel = supabase.channel(signalChannelTopic(participantId));
+      channelRef.current = channel;
 
-      es.addEventListener('expired', () => {
-        es.close();
-        sseRef.current = null;
-      });
-
-      es.onerror = () => {
-        // EventSource auto-reconnects. If the connection is permanently lost
-        // (server returned a non-2xx), the browser will stop retrying after a
-        // few attempts. Nothing to do here — the reconnect loop is built in.
-      };
+      channel
+        .on('broadcast', { event: 'signal' }, (payload: { payload: SignalMessage }) => {
+          if (stoppedRef.current || isStale()) return;
+          void handleSignal(payload.payload);
+        })
+        .subscribe();
     }
 
     async function start() {
@@ -804,7 +810,7 @@ export default function VideoCall() {
         excludeRoomIdRef.current = null;
 
         if (!joinResponse.ok) {
-          setStatus(`Could not join (server said ${joinResponse.status}).`);
+          setStatus('Could not connect. Try again.');
           return;
         }
 
@@ -821,7 +827,7 @@ export default function VideoCall() {
           void loadOpponentIntro(joinData.opponentUsername);
         }
 
-        setStatus('Requesting camera and microphone…');
+        setStatus('Setting up…');
         // On Windows a single physical webcam is often locked by the first tab,
         // so a second tab's getUserMedia({video}) throws. Degrade gracefully so
         // two tabs on one machine (one real camera, one viewer) still connect.
@@ -888,10 +894,10 @@ export default function VideoCall() {
               void applyRelayFallback();
             } else {
               setConnected(false);
-              setStatus('Connection failed — even the relay could not reach the opponent.');
+              setStatus('Connection failed.');
             }
           } else if (state === 'disconnected') {
-            setStatus('Connection lost, retrying…');
+            setStatus('Reconnecting…');
           }
         };
 
@@ -899,12 +905,10 @@ export default function VideoCall() {
           joinData.waiting ? 'Waiting for an opponent to join…' : 'Opponent is already here. Connecting…',
         );
 
-        void connectSSE();
-      } catch (error) {
-        console.error('Failed to start call', error);
-        setStatus(
-          `Could not start the call: ${error instanceof Error ? error.message : 'unknown error'}`,
-        );
+        void connectRealtime();
+      } catch {
+        // Call startup error — ignore, status already shows "Try again".
+        setStatus('Something went wrong. Try again.');
       }
     }
 
@@ -913,6 +917,7 @@ export default function VideoCall() {
     return () => {
       stoppedRef.current = true;
       window.removeEventListener('pagehide', sendByeBeacon);
+      if (channelRef.current) { channelRef.current.unsubscribe(); channelRef.current = null; }
       if (sseRef.current) { sseRef.current.close(); sseRef.current = null; }
       if (relayFallbackTimerRef.current) clearTimeout(relayFallbackTimerRef.current);
       void sendSignal({ type: 'bye' });
@@ -1048,8 +1053,8 @@ export default function VideoCall() {
       await sender.replaceTrack(processed);
       voiceFilterRef.current = filter;
       setChipmunkOn(true);
-    } catch (error) {
-      console.error('Chipmunk filter failed', error);
+    } catch {
+      // Voice filter setup failed — fall back to normal audio.
       // Make sure a half-built graph never keeps running.
       voiceFilterRef.current?.stop();
       voiceFilterRef.current = null;
@@ -1273,10 +1278,6 @@ export default function VideoCall() {
               />
             </div>
 
-            <p className="mt-3 text-center text-[11px] text-white/30">
-              🔒 Audio is analyzed on your device to detect laughs — never recorded or uploaded.
-            </p>
-
             {/* Gift attack. Opening reveals the paste bar. */}
             {giftOpen && (
               <div className="mx-auto mt-4 w-full max-w-md">
@@ -1309,7 +1310,6 @@ export default function VideoCall() {
               <button
                 onClick={() => setGiftOpen((open) => !open)}
                 disabled={!connected}
-                title="Plays on your opponent’s screen"
                 className="rounded-xl border border-fuchsia-400/50 bg-fuchsia-500/10 px-6 py-3 text-sm font-black uppercase tracking-widest text-fuchsia-300 transition hover:bg-fuchsia-500/20 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/5 disabled:text-white/30"
               >
                 {giftOpen ? '🎁 Cancel' : '🎁 Send gift'}
@@ -1317,7 +1317,6 @@ export default function VideoCall() {
               <button
                 onClick={toggleChipmunk}
                 disabled={!connected || chipmunkBusy}
-                title="Pitch-shifts your voice for your opponent"
                 className={`rounded-xl border px-6 py-3 text-sm font-black uppercase tracking-widest transition disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/5 disabled:text-white/30 ${
                   chipmunkOn
                     ? 'border-amber-400 bg-amber-400 text-black hover:bg-amber-300'
